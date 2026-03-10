@@ -165,7 +165,9 @@ async function runInBrowser(options) {
     });
 
     await page.goto(`${server.origin}/automation/A8E/jsA8E/`, {
-      waitUntil: "networkidle",
+      // jsA8E loads third-party fonts/assets that can keep the page "busy"
+      // longer than the automation API actually needs to become ready.
+      waitUntil: "domcontentloaded",
       timeout: Math.max(options.timeoutMs * 2, 10000),
     });
     await page.waitForFunction(
