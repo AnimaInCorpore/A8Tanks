@@ -1,0 +1,11 @@
+{
+  "name": "a8tanks",
+  "private": true,
+  "scripts": {
+    "assemble": "node tools/assemble.js",
+    "run": "node tools/run.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}

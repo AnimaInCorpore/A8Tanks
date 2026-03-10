@@ -1,0 +1,3 @@
+[submodule "automation/A8E"]
+	path = automation/A8E
+	url = https://github.com/AnimaInCorpore/A8E
