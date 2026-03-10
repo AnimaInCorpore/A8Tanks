@@ -6,13 +6,13 @@
 ; ATARI SCREEN CODE CHEAT-SHEET
 ;   Screen RAM holds "internal" codes, not ATASCII.
 ;   Formula:  screen_code = ATASCII - $20   (for printable chars $20..$7F)
-;   Inverse-video variant: add $40 to any screen code (bits become inverted).
+;   Inverse-video variant: add $80 to any screen code (bits become inverted).
 ;
 ;   Common codes (decimal):
-;     0  = space      10 = *      13 = -      29 = =      32 = @
+;     0  = space      10 = * 13 = -      29 = =      32 = @
 ;    33  = A          34 = B  ... 58 = Z
 ;    16  = 0          17 = 1  ... 25 = 9
-;    64  = solid block (inverse space — useful as a filled tile)
+;   128  = solid block (inverse space — useful as a filled tile)
 ;
 ;   STRING TERMINATOR: use $FF (255) — NOT $00, because $00 means space.
 ;
@@ -21,7 +21,7 @@
 ;
 ; ATARI COLOR BYTE FORMAT
 ;   Bits 7-4 : hue   (0=grey, 1=gold, 2=orange, 4=pink, 7=blue,
-;                      8=cyan, 9=teal, B=green, D=yellow, F=red)
+;                     8=cyan, 9=teal, B=green, D=yellow, F=red)
 ;   Bits 3-1 : luminance  0=darkest … 7=brightest  (stored as lum*2)
 ;   Bit  0   : unused (always 0)
 ;
@@ -34,29 +34,10 @@
 ;     To vary colors per scan-line, install a Display List Interrupt (DLI)
 ;     and poke COLPF2/COLBK inside the NMI handler.
 ;
-; SCREEN LAYOUT  (40 cols × 24 rows, all offsets = row*40 + col)
-;
-;   row  0 ············································  (blank)
-;   row  1 ············································
-;   row  2 ············································
-;   row  3 ············································
-;   row  4 ············································
-;   row  5 ========================================      RULE_TOP   $00C8
-;   row  6 ············································  (blank)
-;   row  7          * A8 TANKS *                         TITLE      $0126  col 14
-;   row  8 ············································  (blank)
-;   row  9 ========================================      RULE_BOT   $0168
-;   row 10 ············································  (blank)
-;   row 11 ············································
-;   row 12 ············································
-;   row 13 ············································
-;   row 14               PRESS START                     PROMPT     $023E  col 14
-;   row 15 ············································
-;   …
-;   row 23 ············································
-;
-;   To reposition text: change the *_OFFSET constants and update the
-;   centering column accordingly (col = (40 - text_length) / 2).
+; SCREEN LAYOUT 
+;   Memory is linear. 
+;   Antic Mode 6 (GR.1) uses 20 bytes per row.
+;   Antic Mode 2 (GR.0) uses 40 bytes per row.
 ;
 ; =============================================================================
 
@@ -67,24 +48,37 @@
 ; ---------------------------------------------------------------------------
 CONSOL = $D01F    ; Console keys (bits: 2=SELECT 1=OPTION 0=START); 0 = pressed
 SAVMSC = $58      ; OS zero-page pointer: lo/hi address of screen RAM
+SDLSTL = $0230    ; Shadow for Display List List pointer (lo/hi)
 
-COLPF2 = $D018    ; Playfield color 2 — text foreground in GR.0
-COLBK  = $D01A    ; Background color
+; Corrected Shadow color registers
+COLOR0 = $02C4    ; Shadow for COLPF0
+COLOR1 = $02C5    ; Shadow for COLPF1
+COLOR2 = $02C6    ; Shadow for COLPF2
+COLOR4 = $02C8    ; Shadow for COLBK
+
+COLPF0 = $D016    ; Hardware Playfield color 0
+COLPF1 = $D017    ; Hardware Playfield color 1
+COLPF2 = $D018    ; Hardware Playfield color 2
+COLBK  = $D01A    ; Hardware Background color
+
+NMIEN  = $D40E    ; NMI Enable (bit 7=DLI, 6=VBLANK)
+VDSLST = $0200    ; Vector for Display List Interrupt (DLI)
+
+RTCLOK = $0014    ; OS real-time clock (low byte increments every frame)
+WSYNC  = $D40A    ; Wait for horizontal sync
 
 ; ---------------------------------------------------------------------------
 ; Screen dimensions
 ; ---------------------------------------------------------------------------
-SCREEN_WIDTH  = $28   ; 40 columns per row
+SCREEN_WIDTH  = $28   ; 40 columns per row (GR.0 max width)
 SCREEN_HEIGHT = $18   ; 24 rows
 
 ; ---------------------------------------------------------------------------
-; Screen offsets for each drawn element (row * 40 + col)
-; Adjust these to move elements without touching the draw code.
+; Screen offsets (byte offset from screen RAM base)
 ; ---------------------------------------------------------------------------
-RULE_TOP_OFFSET      = $00C8   ; row  5, col  0  — top horizontal rule
-TITLE_SCREEN_OFFSET  = $0126   ; row  7, col 14  — title string (12 chars)
-RULE_BOT_OFFSET      = $0168   ; row  9, col  0  — bottom horizontal rule
-PROMPT_SCREEN_OFFSET = $023E   ; row 14, col 14  — "PRESS START" (11 chars)
+TITLE_OFFSET    = $0004 ; Centered in 20-col GR.1 (Row 0)
+RULE_TOP_OFFSET = $0014 ; Row 1 (first GR.0 row, starts at byte 20)
+PROMPT_OFFSET   = $0158 ; Row 9 (GR.1, 340 bytes in + col 4 = 344)
 
 ; =============================================================================
 ; PROGRAM ENTRY
@@ -101,111 +95,191 @@ GAME_LOOP:
   JMP GAME_LOOP
 
 ; ---------------------------------------------------------------------------
-; INIT — set up initial game state (called once at boot)
+; INIT — set up initial game state
 ; ---------------------------------------------------------------------------
 INIT:
   LDA #$50
-  STA PLAYER_X          ; start position X
+  STA PLAYER_X
   LDA #$30
-  STA PLAYER_Y          ; start position Y
+  STA PLAYER_Y
   LDA #$00
-  STA PLAYER_DIR        ; 0=up  1=right  2=down  3=left
+  STA PLAYER_DIR
   STA FRAME_COUNTER
+  
+  ; Patch Display List screen RAM address to match OS SAVMSC
+  JSR PATCH_DL
+
+  ; Set up Display List
+  LDA #<MY_DISPLAY_LIST
+  STA SDLSTL
+  LDA #>MY_DISPLAY_LIST
+  STA SDLSTL+1
+
+  ; Set up DLI
+  LDA #<DLI_HANDLER
+  STA VDSLST
+  LDA #>DLI_HANDLER
+  STA VDSLST+1
+  LDA #$C0              ; Enable DLI and VBLANK
+  STA NMIEN
   RTS
 
 ; ---------------------------------------------------------------------------
-; INIT_COLORS — set the title-screen palette
-;   Tweak COLBK / COLPF2 here to change the color scheme.
-;   The values follow the Atari color byte format described at the top.
+; INIT_COLORS — set the title-screen palette (using shadow registers)
 ; ---------------------------------------------------------------------------
 INIT_COLORS:
-  LDA #$00      ; $00 = black background
-  STA COLBK
-  LDA #$1C      ; $1C = bright yellow/gold text  (hue 1, lum 6)
-  STA COLPF2    ; try $28 for orange, $38 for peach, $B8 for green, $94 for blue
+  LDA #$00      ; Black border
+  STA COLOR4
+  LDA #$94      ; Dark blue background
+  STA COLOR2
+  LDA #$0E      ; White/Grey text luminance
+  STA COLOR1
+  LDA #$1C      ; Gold for GR.1 title (COLOR0)
+  STA COLOR0
   RTS
+
+; ---------------------------------------------------------------------------
+; DLI_HANDLER — creating a "rainbow" effect for the title
+; ---------------------------------------------------------------------------
+DLI_HANDLER:
+  PHA           ; Save registers
+  TXA
+  PHA
+  
+  LDX #$00
+DLI_LOOP:
+  LDA RAINBOW_TABLE,X
+  STA WSYNC     ; Wait for next scanline
+  STA COLPF0    ; Change color of Antic Mode 6 text
+  INX
+  CPX #16       ; Do it for 16 scanlines (2 rows of Antic 6 = 16 scanlines)
+  BNE DLI_LOOP
+
+  PLA           ; Restore registers
+  TAX
+  PLA
+  RTI
+
+RAINBOW_TABLE:
+  .BYTE $12,$14,$16,$18,$1A,$1C,$1E,$1C,$1A,$18,$16,$14,$12,$10,$0E,$0C
 
 ; =============================================================================
 ; TITLE SCREEN
 ; =============================================================================
 
-; ---------------------------------------------------------------------------
-; SHOW_TITLE_SCREEN — draw title then wait for START press
-; ---------------------------------------------------------------------------
 SHOW_TITLE_SCREEN:
   JSR DRAW_TITLE_SCREEN
 
 WAIT_FOR_START_RELEASE:
   JSR READ_START_KEY
-  BEQ WAIT_FOR_START_RELEASE    ; spin while START is already held
+  BEQ WAIT_FOR_START_RELEASE
 
 WAIT_FOR_START_PRESS:
+  LDA RTCLOK
+WAIT_FRAME:
+  CMP RTCLOK
+  BEQ WAIT_FRAME
+  JSR UPDATE_TITLE_ANIMATION
   JSR READ_START_KEY
-  BNE WAIT_FOR_START_PRESS      ; spin until START goes low (pressed)
+  BNE WAIT_FOR_START_PRESS
 
-  JSR CLEAR_SCREEN              ; wipe screen before gameplay begins
+  JSR CLEAR_SCREEN
   RTS
 
-; ---------------------------------------------------------------------------
-; READ_START_KEY — returns Z=1 (BEQ branches) when START is pressed
-;   CONSOL bit 0: 1=released, 0=pressed.  AND #$01 isolates that bit.
-; ---------------------------------------------------------------------------
+UPDATE_TITLE_ANIMATION:
+  INC FRAME_COUNTER
+  LDA FRAME_COUNTER
+  AND #$1F
+  BNE UPDATE_DONE
+
+  LDY #10
+BLINK_LOOP:
+  LDA START_PROMPT_TEXT,Y
+  EOR #$40
+  STA START_PROMPT_TEXT,Y
+  DEY
+  BPL BLINK_LOOP
+
+  LDA #<START_PROMPT_TEXT
+  STA TEXT_SOURCE
+  LDA #>START_PROMPT_TEXT
+  STA TEXT_SOURCE+1
+  LDA #<PROMPT_OFFSET
+  STA TEXT_OFFSET
+  LDA #>PROMPT_OFFSET
+  STA TEXT_OFFSET+1
+  JSR DRAW_TEXT_AT
+
+UPDATE_DONE:
+  RTS
+
 READ_START_KEY:
   LDA CONSOL
-  AND #$01      ; isolate START bit  (0 = pressed → Z flag set)
+  AND #$01
   RTS
 
-; ---------------------------------------------------------------------------
-; DRAW_TITLE_SCREEN — compose the full title screen
-;   To add more lines, call DRAW_TEXT_AT with a new TEXT_SOURCE / TEXT_OFFSET.
-;   To add a blinking effect on PRESS START, toggle inverse video on the
-;   string bytes every N frames using FRAME_COUNTER (add $40 to each byte
-;   to invert, subtract $40 to restore).
-; ---------------------------------------------------------------------------
 DRAW_TITLE_SCREEN:
   JSR CLEAR_SCREEN
   JSR INIT_COLORS
 
-  ; Row 5: top rule  ========================================
-  LDA #$1D          ; '=' = screen code 29 ($3D - $20)
-  STA RULE_CHAR     ; swap to $0D for '---', $40 for solid blocks
+  ; Row 0: Large title (Antic Mode 6 / GR.1)
+  LDA #<TITLE_TEXT
+  STA TEXT_SOURCE
+  LDA #>TITLE_TEXT
+  STA TEXT_SOURCE+1
+  LDA #<TITLE_OFFSET
+  STA TEXT_OFFSET
+  LDA #>TITLE_OFFSET
+  STA TEXT_OFFSET+1
+  JSR DRAW_TEXT_AT
+
+  ; Row 1: Top rule (Antic Mode 2 / GR.0)
+  LDA #$80          ; $80 = solid block (inverse space). $40 is a heart!
+  STA RULE_CHAR
   LDA #<RULE_TOP_OFFSET
   STA TEXT_OFFSET
   LDA #>RULE_TOP_OFFSET
   STA TEXT_OFFSET+1
   JSR DRAW_RULE
 
-  ; Row 7: title string  "* A8 TANKS *"
-  LDA #<TITLE_TEXT
-  STA TEXT_SOURCE
-  LDA #>TITLE_TEXT
-  STA TEXT_SOURCE+1
-  LDA #<TITLE_SCREEN_OFFSET
-  STA TEXT_OFFSET
-  LDA #>TITLE_SCREEN_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_TEXT_AT
-
-  ; Row 9: bottom rule  ========================================
-  LDA #$1D
-  STA RULE_CHAR
-  LDA #<RULE_BOT_OFFSET
-  STA TEXT_OFFSET
-  LDA #>RULE_BOT_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_RULE
-
-  ; Row 14: start prompt  "PRESS START"
+  ; Row 9: Start prompt
   LDA #<START_PROMPT_TEXT
   STA TEXT_SOURCE
   LDA #>START_PROMPT_TEXT
   STA TEXT_SOURCE+1
-  LDA #<PROMPT_SCREEN_OFFSET
+  LDA #<PROMPT_OFFSET
   STA TEXT_OFFSET
-  LDA #>PROMPT_SCREEN_OFFSET
+  LDA #>PROMPT_OFFSET
   STA TEXT_OFFSET+1
   JSR DRAW_TEXT_AT
   RTS
+
+; ---------------------------------------------------------------------------
+; DISPLAY LIST
+; ---------------------------------------------------------------------------
+MY_DISPLAY_LIST:
+  .BYTE $70,$70,$F0     ; 24 blank lines (last 8 have DLI bit set via $F0)
+  .BYTE $46             ; Row 0: Antic Mode 6 (GR.1) + LMS
+  .WORD $BC00           ; Screen RAM address (patched later)
+  .BYTE $00             ; 8 Blank scanlines
+  .BYTE $02             ; Row 1: Antic Mode 2 (GR.0) - Top Rule
+  .BYTE $02,$02,$02,$02 ; Row 2-5: GR.0
+  .BYTE $02,$02,$02     ; Row 6-8: GR.0
+  .BYTE $06             ; Row 9: Antic Mode 6 (GR.1) - PROMPT ROW
+  .BYTE $02,$02,$02,$02 ; Row 10-13: GR.0
+  .BYTE $02,$02,$02,$02 ; Row 14-17: GR.0
+  .BYTE $02,$02         ; Row 18-19: GR.0
+  .BYTE $41             ; JMP and Wait for VBLANK
+  .WORD MY_DISPLAY_LIST
+
+; We need to patch the LMS address in the Display List to match SAVMSC
+PATCH_DL:
+  LDA SAVMSC
+  STA MY_DISPLAY_LIST+4
+  LDA SAVMSC+1
+  STA MY_DISPLAY_LIST+5
+  RTS
+
 
 ; =============================================================================
 ; LOW-LEVEL DRAWING ROUTINES
@@ -375,13 +449,13 @@ TEXT_OFFSET:
 ; STRING DATA  (Atari screen codes — see cheat-sheet at top of file)
 ; =============================================================================
 
-; "* A8 TANKS *" — 12 chars, placed at col 14 → (40 - 12) / 2 = 14
+; "* A8 TANKS *" — 12 chars
 ;  *=10 ' '=0 A=33 8=24 ' '=0 T=52 A=33 N=46 K=43 S=51 ' '=0 *=10  $FF=end
 ;  NOTE: $00 = space (not the terminator) — terminator is always $FF
 TITLE_TEXT:
   .BYTE 10,0,33,24,0,52,33,46,43,51,0,10,$FF
 
-; "PRESS START" — 11 chars, placed at col 14 → (40 - 11) / 2 = 14  (rounded)
+; "PRESS START" — 11 chars
 ;  P=48 R=50 E=37 S=51 S=51 ' '=0 S=51 T=52 A=33 R=50 T=52  $FF=end
 START_PROMPT_TEXT:
   .BYTE 48,50,37,51,51,0,51,52,33,50,52,$FF
