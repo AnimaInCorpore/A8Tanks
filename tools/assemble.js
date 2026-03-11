@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 
 const { assembleFile, repoRoot } = require("./lib/jsa8e_assembler");
+const { convertXexToAtr } = require("./lib/xex_to_atr");
 
 function printHelp() {
   console.log(`Usage: node tools/assemble.js [options]
@@ -12,6 +13,7 @@ function printHelp() {
 Options:
   --source <path>   Assembly source file to build
   --output <path>   Output XEX path
+  --atr-output <path>  Output ATR path (default: sibling of XEX output)
   --help            Show this help
 `);
 }
@@ -34,6 +36,11 @@ function parseArgs(argv) {
       index += 1;
       continue;
     }
+    if (arg === "--atr-output") {
+      options.atrOutput = argv[index + 1];
+      index += 1;
+      continue;
+    }
     throw new Error(`Unknown argument: ${arg}`);
   }
   return options;
@@ -41,6 +48,13 @@ function parseArgs(argv) {
 
 function resolveFromRepo(inputPath) {
   return path.resolve(repoRoot, inputPath);
+}
+
+function defaultAtrOutputFor(xexOutputPath) {
+  return path.join(
+    path.dirname(xexOutputPath),
+    `${path.basename(xexOutputPath, path.extname(xexOutputPath))}.atr`,
+  );
 }
 
 function main() {
@@ -53,10 +67,20 @@ function main() {
   const sourcePath = resolveFromRepo(options.source || "src/a8tanks.asm");
   const defaultOutput = `build/${path.basename(sourcePath, path.extname(sourcePath))}.xex`;
   const outputPath = resolveFromRepo(options.output || defaultOutput);
+  const atrOutputPath = resolveFromRepo(
+    options.atrOutput || defaultAtrOutputFor(outputPath),
+  );
   const assembled = assembleFile(sourcePath);
+  const atrBytes = convertXexToAtr(assembled.bytes);
+
+  if (!atrBytes) {
+    throw new Error("Unable to convert assembled XEX into a bootable ATR.");
+  }
 
   fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, assembled.bytes);
+  fs.mkdirSync(path.dirname(atrOutputPath), { recursive: true });
+  fs.writeFileSync(atrOutputPath, atrBytes);
 
   const build = assembled.result;
   const runAddr =
@@ -66,6 +90,7 @@ function main() {
 
   console.log(`Source : ${path.relative(repoRoot, sourcePath)}`);
   console.log(`Output : ${path.relative(repoRoot, outputPath)}`);
+  console.log(`ATR    : ${path.relative(repoRoot, atrOutputPath)}`);
   console.log(`Bytes  : ${assembled.bytes.length}`);
   console.log(`Run    : ${runAddr}`);
 }

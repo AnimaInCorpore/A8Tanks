@@ -126,42 +126,131 @@ INIT:
 
 ; ---------------------------------------------------------------------------
 ; INIT_COLORS — set the title-screen palette (using shadow registers)
+;   Shadow registers are overridden per-scanline by the DLI during the sky
+;   area.  These values take effect below the DLI region (row 12 onward).
 ; ---------------------------------------------------------------------------
 INIT_COLORS:
-  LDA #$00      ; Black border
+  LDA #$84      ; Dark blue — matches top-of-sky; colors the 24 blank lines above DLI
   STA COLOR4
-  LDA #$94      ; Dark blue background
+  LDA #$00      ; Black background (below DLI region)
   STA COLOR2
-  LDA #$0E      ; White/Grey text luminance
+  LDA #$0E      ; White text luminance
   STA COLOR1
-  LDA #$1C      ; Gold for GR.1 title (COLOR0)
+  LDA #$1C      ; Gold for GR.1 title/prompt (COLOR0)
   STA COLOR0
   RTS
 
 ; ---------------------------------------------------------------------------
-; DLI_HANDLER — creating a "rainbow" effect for the title
+; DLI_HANDLER — daytime sky horizon effect
+;   Fires before the title row, runs for 96 scanlines (~half the screen).
+;   Per scanline:
+;     COLPF0 = title text color (gold shimmer on first 8 scanlines)
+;     COLPF1 = foreground/rule color (white through sky, fades below horizon)
+;     COLPF2 = background color (deep blue → light blue → near-white horizon
+;                                → quick fade to black below)
+;   After loop, shadow registers are restored so PRESS START renders correctly.
 ; ---------------------------------------------------------------------------
 DLI_HANDLER:
-  PHA           ; Save registers
+  PHA           ; Save A
   TXA
-  PHA
-  
+  PHA           ; Save X
+
   LDX #$00
 DLI_LOOP:
-  LDA RAINBOW_TABLE,X
-  STA WSYNC     ; Wait for next scanline
-  STA COLPF0    ; Change color of Antic Mode 6 text
+  STA WSYNC          ; Wait for next scanline (value in A is irrelevant)
+  LDA SKY_PF0,X
+  STA COLPF0         ; Title text hue (only visible in Mode 6 rows)
+  LDA SKY_PF1,X
+  STA COLPF1         ; Foreground / rule line color
+  LDA SKY_PF2,X
+  STA COLPF2         ; Background color
   INX
-  CPX #16       ; Do it for 16 scanlines (2 rows of Antic 6 = 16 scanlines)
+  CPX #96
   BNE DLI_LOOP
 
-  PLA           ; Restore registers
+  ; Restore color registers for the remainder of the frame
+  ; (so PRESS START in Mode 6 and any GR.0 rows below render correctly)
+  LDA COLOR0         ; $1C gold — used by COLPF0 for Mode 6 text
+  STA COLPF0
+  LDA COLOR1         ; $0E bright — foreground luminance
+  STA COLPF1
+  LDA COLOR2         ; $00 black — background
+  STA COLPF2
+
+  PLA           ; Restore X
   TAX
-  PLA
+  PLA           ; Restore A
   RTI
 
-RAINBOW_TABLE:
-  .BYTE $12,$14,$16,$18,$1A,$1C,$1E,$1C,$1A,$18,$16,$14,$12,$10,$0E,$0C
+; ---- Scanline color tables (96 entries each) --------------------------------
+;  Scanline layout from DLI fire point:
+;    0-7   : title row (Mode 6) — deep blue sky
+;    8     : 1 blank scanline ($00 DL byte = 1 blank line)
+;    9-16  : rule row — the "horizon" separator
+;   17-72  : GR.0 rows 2-8 — slow luminance fade (ground below horizon)
+;   73-80  : GR.0 row 9 (Mode 6) — PRESS START prompt
+;   81-95  : GR.0 rows 10-11 — black
+;
+;  Half-screen coverage:
+;    COLOR4=$84 colors the 24 OS blank scanlines above the DLI dark blue.
+;    SKY_PF2 stays visible (non-zero) through entry ~73, then fades out.
+;    24 (blank, dark blue) + 74 (DLI visible) ≈ 98 / 192 total scanlines.
+;
+;  Color scheme: natural clear-sky day
+;    24 blank lines above: dark blue (COLOR4=$84, set in INIT_COLORS)
+;    Top of sky (0-7)    : deep blue  ($86→$8E)
+;    Mid sky  (8-16)     : lightening blue → near-white
+;    Horizon (16-23)     : near-white atmospheric haze peak ($0E)
+;    Below (24-73)       : very slow grey fade — ~9 scanlines per luminance step
+;    Ground (74-95)      : black
+
+; COLPF0 — title text + PRESS START text (only effective in Mode 6 rows)
+;   Title is DLI entries 0-7; PRESS START is entries 73-80.
+SKY_PF0:
+  .BYTE $1A,$1C,$1E,$1C,$1A,$1C,$1E,$1C  ; 0-7  : title gold shimmer on blue sky
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 8-15 : not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 16-23: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 24-31: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 32-39: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 40-47: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 48-55: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 56-63: not Mode 6
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 64-71: not Mode 6
+  .BYTE $00,$1C,$1C,$1C,$1C,$1C,$1C,$1C  ; 72-79: 73-80 = PRESS START (gold)
+  .BYTE $1C,$00,$00,$00,$00,$00,$00,$00  ; 80-87: entry 80 = last sl of prompt
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
+
+; COLPF1 — foreground / rule line color (white in sky zone + PRESS START blink)
+SKY_PF1:
+  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 0-7  : white in title area
+  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 8-15 : white in sky gap
+  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 16-23: white at horizon (rule glows)
+  .BYTE $0C,$0A,$08,$06,$04,$02,$00,$00  ; 24-31: below horizon, fading
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 32-39: black
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 40-47: black
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 48-55: black
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 56-63: black
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 64-71: black
+  .BYTE $00,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 72-79: 73-80 = PRESS START blink color
+  .BYTE $0E,$00,$00,$00,$00,$00,$00,$00  ; 80-87: entry 80 = last sl of prompt
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
+
+; COLPF2 — background (sky: deep blue → near-white horizon → very slow fade to black)
+;  Below the horizon: 7 luminance steps × ~9 scanlines each = 63 scanlines of fade.
+;  Reaches black near entry 73, matching the PRESS START prompt row.
+SKY_PF2:
+  .BYTE $86,$86,$88,$88,$8A,$8C,$8C,$8E  ; 0-7  : deep blue → medium blue (title row)
+  .BYTE $8E,$8E,$7E,$7E,$7E,$0E,$0E,$0E  ; 8-15 : light blue → near-white
+  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 16-23: near-white (horizon area peak)
+  .BYTE $0E,$0E,$0C,$0C,$0C,$0C,$0C,$0C  ; 24-31: just below, starts fading
+  .BYTE $0C,$0A,$0A,$0A,$0A,$0A,$0A,$0A  ; 32-39: slow fade continues
+  .BYTE $0A,$08,$08,$08,$08,$08,$08,$08  ; 40-47: ~9 sl per luminance step
+  .BYTE $08,$06,$06,$06,$06,$06,$06,$06  ; 48-55
+  .BYTE $06,$04,$04,$04,$04,$04,$04,$04  ; 56-63
+  .BYTE $04,$02,$02,$02,$02,$02,$02,$02  ; 64-71
+  .BYTE $02,$02,$00,$00,$00,$00,$00,$00  ; 72-79: fades to black (PRESS START bg)
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 80-87: black
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
 
 ; =============================================================================
 ; TITLE SCREEN
