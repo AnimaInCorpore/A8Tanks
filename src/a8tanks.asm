@@ -1,264 +1,108 @@
 ; =============================================================================
-; A8Tanks — Atari 800 XL tank game
-; Built with jsA8E / MADS assembler.  Entry point: $2000.
-; =============================================================================
-;
-; ATARI SCREEN CODE CHEAT-SHEET
-;   Screen RAM holds "internal" codes, not ATASCII.
-;   Formula:  screen_code = ATASCII - $20   (for printable chars $20..$7F)
-;   Inverse-video variant: add $80 to any screen code (bits become inverted).
-;
-;   Common codes (decimal):
-;     0  = space      10 = * 13 = -      29 = =      32 = @
-;    33  = A          34 = B  ... 58 = Z
-;    16  = 0          17 = 1  ... 25 = 9
-;   128  = solid block (inverse space — useful as a filled tile)
-;
-;   STRING TERMINATOR: use $FF (255) — NOT $00, because $00 means space.
-;
-;   To encode a new string, subtract 32 from each ASCII value:
-;     e.g. "GAME OVER" → G=39 A=33 M=45 E=37 ' '=0 O=47 V=54 E=37 R=50
-;
-; ATARI COLOR BYTE FORMAT
-;   Bits 7-4 : hue   (0=grey, 1=gold, 2=orange, 4=pink, 7=blue,
-;                     8=cyan, 9=teal, B=green, D=yellow, F=red)
-;   Bits 3-1 : luminance  0=darkest … 7=brightest  (stored as lum*2)
-;   Bit  0   : unused (always 0)
-;
-;   Useful values:  $00=black  $0E=dark grey  $1C=bright gold  $28=orange
-;                   $38=peach  $86=dark blue  $94=navy  $B8=bright green
-;
-;   In GR.0 (ANTIC mode 2, 40×24 text):
-;     COLBK  ($D01A) = background color
-;     COLPF2 ($D018) = text/foreground color
-;     To vary colors per scan-line, install a Display List Interrupt (DLI)
-;     and poke COLPF2/COLBK inside the NMI handler.
-;
-; SCREEN LAYOUT 
-;   Memory is linear. 
-;   Antic Mode 6 (GR.1) uses 20 bytes per row.
-;   Antic Mode 2 (GR.0) uses 40 bytes per row.
-;
+; A8Tanks - Atari 800 XL tank game
+; Generated bitmap start screen. Regenerate with:
+;   node tools/generate_start_screen.js
 ; =============================================================================
 
 .ORG $2000
 
-; ---------------------------------------------------------------------------
-; Hardware registers
-; ---------------------------------------------------------------------------
-CONSOL = $D01F    ; Console keys (bits: 2=SELECT 1=OPTION 0=START); 0 = pressed
-SAVMSC = $58      ; OS zero-page pointer: lo/hi address of screen RAM
-SDLSTL = $0230    ; Shadow for Display List List pointer (lo/hi)
+CONSOL = $D01F
+PORTB  = $D301
+SDMCTL = $022F
+SDLSTL = $0230
 
-; Corrected Shadow color registers
-COLOR0 = $02C4    ; Shadow for COLPF0
-COLOR1 = $02C5    ; Shadow for COLPF1
-COLOR2 = $02C6    ; Shadow for COLPF2
-COLOR4 = $02C8    ; Shadow for COLBK
+COLOR0 = $02C4
+COLOR1 = $02C5
+COLOR2 = $02C6
+COLOR4 = $02C8
 
-COLPF0 = $D016    ; Hardware Playfield color 0
-COLPF1 = $D017    ; Hardware Playfield color 1
-COLPF2 = $D018    ; Hardware Playfield color 2
-COLBK  = $D01A    ; Hardware Background color
+COLPF0 = $D016
+COLPF1 = $D017
+COLPF2 = $D018
+COLBK  = $D01A
 
-NMIEN  = $D40E    ; NMI Enable (bit 7=DLI, 6=VBLANK)
-VDSLST = $0200    ; Vector for Display List Interrupt (DLI)
+NMIEN  = $D40E
+VDSLST = $0200
+RTCLOK = $0014
+WSYNC  = $D40A
 
-RTCLOK = $0014    ; OS real-time clock (low byte increments every frame)
-WSYNC  = $D40A    ; Wait for horizontal sync
-
-; ---------------------------------------------------------------------------
-; Screen dimensions
-; ---------------------------------------------------------------------------
-SCREEN_WIDTH  = $28   ; 40 columns per row (GR.0 max width)
-SCREEN_HEIGHT = $18   ; 24 rows
-
-; ---------------------------------------------------------------------------
-; Screen offsets (byte offset from screen RAM base)
-; ---------------------------------------------------------------------------
-TITLE_OFFSET    = $0004 ; Centered in 20-col GR.1 (Row 0)
-RULE_TOP_OFFSET = $0014 ; Row 1 (first GR.0 row, starts at byte 20)
-PROMPT_OFFSET   = $0158 ; Row 9 (GR.1, 340 bytes in + col 4 = 344)
-
-; =============================================================================
-; PROGRAM ENTRY
-; =============================================================================
+START_SCREEN_ROWS = $E0
 
 START:
   JSR INIT
   JSR SHOW_TITLE_SCREEN
 
 GAME_LOOP:
-  JSR READ_INPUT
-  JSR UPDATE_GAME
-  JSR DRAW_FRAME
   JMP GAME_LOOP
 
-; ---------------------------------------------------------------------------
-; INIT — set up initial game state
-; ---------------------------------------------------------------------------
 INIT:
-  LDA #$50
-  STA PLAYER_X
-  LDA #$30
-  STA PLAYER_Y
   LDA #$00
-  STA PLAYER_DIR
   STA FRAME_COUNTER
-  
-  ; Patch Display List screen RAM address to match OS SAVMSC
-  JSR PATCH_DL
+  LDA #$FF              ; keep OS ROM, disable BASIC, disable self-test
+  STA PORTB
+  LDA #$22              ; display list DMA + normal playfield width
+  STA SDMCTL
+  JSR INIT_COLORS
 
-  ; Set up Display List
   LDA #<MY_DISPLAY_LIST
   STA SDLSTL
   LDA #>MY_DISPLAY_LIST
   STA SDLSTL+1
 
-  ; Set up DLI
   LDA #<DLI_HANDLER
   STA VDSLST
   LDA #>DLI_HANDLER
   STA VDSLST+1
-  LDA #$C0              ; Enable DLI and VBLANK
+  LDA #$C0              ; enable DLI and OS VBLANK
   STA NMIEN
   RTS
 
-; ---------------------------------------------------------------------------
-; INIT_COLORS — set the title-screen palette (using shadow registers)
-;   Shadow registers are overridden per-scanline by the DLI during the sky
-;   area.  These values take effect below the DLI region (row 12 onward).
-; ---------------------------------------------------------------------------
 INIT_COLORS:
-  LDA #$84      ; Dark blue — matches top-of-sky; colors the 24 blank lines above DLI
+  LDA #$00
   STA COLOR4
-  LDA #$00      ; Black background (below DLI region)
-  STA COLOR2
-  LDA #$0E      ; White text luminance
-  STA COLOR1
-  LDA #$1C      ; Gold for GR.1 title/prompt (COLOR0)
+  STA COLBK
+  LDA #$10
   STA COLOR0
+  STA COLPF0
+  LDA #$20
+  STA COLOR1
+  STA COLPF1
+  LDA #$30
+  STA COLOR2
+  STA COLPF2
   RTS
 
-; ---------------------------------------------------------------------------
-; DLI_HANDLER — daytime sky horizon effect
-;   Fires before the title row, runs for 96 scanlines (~half the screen).
-;   Per scanline:
-;     COLPF0 = title text color (gold shimmer on first 8 scanlines)
-;     COLPF1 = foreground/rule color (white through sky, fades below horizon)
-;     COLPF2 = background color (deep blue → light blue → near-white horizon
-;                                → quick fade to black below)
-;   After loop, shadow registers are restored so PRESS START renders correctly.
-; ---------------------------------------------------------------------------
 DLI_HANDLER:
-  PHA           ; Save A
+  PHA
   TXA
-  PHA           ; Save X
+  PHA
 
   LDX #$00
 DLI_LOOP:
-  STA WSYNC          ; Wait for next scanline (value in A is irrelevant)
-  LDA SKY_PF0,X
-  STA COLPF0         ; Title text hue (only visible in Mode 6 rows)
-  LDA SKY_PF1,X
-  STA COLPF1         ; Foreground / rule line color
-  LDA SKY_PF2,X
-  STA COLPF2         ; Background color
+  STA WSYNC
+  LDA START_COLBK,X
+  STA COLBK
+  LDA START_PF0,X
+  STA COLPF0
+  LDA START_PF1,X
+  STA COLPF1
+  LDA START_PF2,X
+  STA COLPF2
   INX
-  CPX #96
+  CPX #START_SCREEN_ROWS
   BNE DLI_LOOP
 
-  ; Restore color registers for the remainder of the frame
-  ; (so PRESS START in Mode 6 and any GR.0 rows below render correctly)
-  LDA COLOR0         ; $1C gold — used by COLPF0 for Mode 6 text
-  STA COLPF0
-  LDA COLOR1         ; $0E bright — foreground luminance
-  STA COLPF1
-  LDA COLOR2         ; $00 black — background
-  STA COLPF2
+  STA WSYNC
+  LDA #$00
+  STA COLBK
+  STA COLOR4
 
-  PLA           ; Restore X
+  PLA
   TAX
-  PLA           ; Restore A
+  PLA
   RTI
 
-; ---- Scanline color tables (96 entries each) --------------------------------
-;  Scanline layout from DLI fire point:
-;    0-7   : title row (Mode 6) — deep blue sky
-;    8     : 1 blank scanline ($00 DL byte = 1 blank line)
-;    9-16  : rule row — the "horizon" separator
-;   17-72  : GR.0 rows 2-8 — slow luminance fade (ground below horizon)
-;   73-80  : GR.0 row 9 (Mode 6) — PRESS START prompt
-;   81-95  : GR.0 rows 10-11 — black
-;
-;  Half-screen coverage:
-;    COLOR4=$84 colors the 24 OS blank scanlines above the DLI dark blue.
-;    SKY_PF2 stays visible (non-zero) through entry ~73, then fades out.
-;    24 (blank, dark blue) + 74 (DLI visible) ≈ 98 / 192 total scanlines.
-;
-;  Color scheme: natural clear-sky day
-;    24 blank lines above: dark blue (COLOR4=$84, set in INIT_COLORS)
-;    Top of sky (0-7)    : deep blue  ($86→$8E)
-;    Mid sky  (8-16)     : lightening blue → near-white
-;    Horizon (16-23)     : near-white atmospheric haze peak ($0E)
-;    Below (24-73)       : very slow grey fade — ~9 scanlines per luminance step
-;    Ground (74-95)      : black
-
-; COLPF0 — title text + PRESS START text (only effective in Mode 6 rows)
-;   Title is DLI entries 0-7; PRESS START is entries 73-80.
-SKY_PF0:
-  .BYTE $1A,$1C,$1E,$1C,$1A,$1C,$1E,$1C  ; 0-7  : title gold shimmer on blue sky
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 8-15 : not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 16-23: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 24-31: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 32-39: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 40-47: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 48-55: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 56-63: not Mode 6
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 64-71: not Mode 6
-  .BYTE $00,$1C,$1C,$1C,$1C,$1C,$1C,$1C  ; 72-79: 73-80 = PRESS START (gold)
-  .BYTE $1C,$00,$00,$00,$00,$00,$00,$00  ; 80-87: entry 80 = last sl of prompt
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
-
-; COLPF1 — foreground / rule line color (white in sky zone + PRESS START blink)
-SKY_PF1:
-  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 0-7  : white in title area
-  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 8-15 : white in sky gap
-  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 16-23: white at horizon (rule glows)
-  .BYTE $0C,$0A,$08,$06,$04,$02,$00,$00  ; 24-31: below horizon, fading
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 32-39: black
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 40-47: black
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 48-55: black
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 56-63: black
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 64-71: black
-  .BYTE $00,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 72-79: 73-80 = PRESS START blink color
-  .BYTE $0E,$00,$00,$00,$00,$00,$00,$00  ; 80-87: entry 80 = last sl of prompt
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
-
-; COLPF2 — background (sky: deep blue → near-white horizon → very slow fade to black)
-;  Below the horizon: 7 luminance steps × ~9 scanlines each = 63 scanlines of fade.
-;  Reaches black near entry 73, matching the PRESS START prompt row.
-SKY_PF2:
-  .BYTE $86,$86,$88,$88,$8A,$8C,$8C,$8E  ; 0-7  : deep blue → medium blue (title row)
-  .BYTE $8E,$8E,$7E,$7E,$7E,$0E,$0E,$0E  ; 8-15 : light blue → near-white
-  .BYTE $0E,$0E,$0E,$0E,$0E,$0E,$0E,$0E  ; 16-23: near-white (horizon area peak)
-  .BYTE $0E,$0E,$0C,$0C,$0C,$0C,$0C,$0C  ; 24-31: just below, starts fading
-  .BYTE $0C,$0A,$0A,$0A,$0A,$0A,$0A,$0A  ; 32-39: slow fade continues
-  .BYTE $0A,$08,$08,$08,$08,$08,$08,$08  ; 40-47: ~9 sl per luminance step
-  .BYTE $08,$06,$06,$06,$06,$06,$06,$06  ; 48-55
-  .BYTE $06,$04,$04,$04,$04,$04,$04,$04  ; 56-63
-  .BYTE $04,$02,$02,$02,$02,$02,$02,$02  ; 64-71
-  .BYTE $02,$02,$00,$00,$00,$00,$00,$00  ; 72-79: fades to black (PRESS START bg)
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 80-87: black
-  .BYTE $00,$00,$00,$00,$00,$00,$00,$00  ; 88-95: black
-
-; =============================================================================
-; TITLE SCREEN
-; =============================================================================
-
 SHOW_TITLE_SCREEN:
-  JSR DRAW_TITLE_SCREEN
-
 WAIT_FOR_START_RELEASE:
   JSR READ_START_KEY
   BEQ WAIT_FOR_START_RELEASE
@@ -268,38 +112,9 @@ WAIT_FOR_START_PRESS:
 WAIT_FRAME:
   CMP RTCLOK
   BEQ WAIT_FRAME
-  JSR UPDATE_TITLE_ANIMATION
+  INC FRAME_COUNTER
   JSR READ_START_KEY
   BNE WAIT_FOR_START_PRESS
-
-  JSR CLEAR_SCREEN
-  RTS
-
-UPDATE_TITLE_ANIMATION:
-  INC FRAME_COUNTER
-  LDA FRAME_COUNTER
-  AND #$1F
-  BNE UPDATE_DONE
-
-  LDY #10
-BLINK_LOOP:
-  LDA START_PROMPT_TEXT,Y
-  EOR #$40
-  STA START_PROMPT_TEXT,Y
-  DEY
-  BPL BLINK_LOOP
-
-  LDA #<START_PROMPT_TEXT
-  STA TEXT_SOURCE
-  LDA #>START_PROMPT_TEXT
-  STA TEXT_SOURCE+1
-  LDA #<PROMPT_OFFSET
-  STA TEXT_OFFSET
-  LDA #>PROMPT_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_TEXT_AT
-
-UPDATE_DONE:
   RTS
 
 READ_START_KEY:
@@ -307,246 +122,809 @@ READ_START_KEY:
   AND #$01
   RTS
 
-DRAW_TITLE_SCREEN:
-  JSR CLEAR_SCREEN
-  JSR INIT_COLORS
+FRAME_COUNTER:
+  .BYTE $00
 
-  ; Row 0: Large title (Antic Mode 6 / GR.1)
-  LDA #<TITLE_TEXT
-  STA TEXT_SOURCE
-  LDA #>TITLE_TEXT
-  STA TEXT_SOURCE+1
-  LDA #<TITLE_OFFSET
-  STA TEXT_OFFSET
-  LDA #>TITLE_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_TEXT_AT
+.ORG $2C00
 
-  ; Row 1: Top rule (Antic Mode 2 / GR.0)
-  LDA #$80          ; $80 = solid block (inverse space). $40 is a heart!
-  STA RULE_CHAR
-  LDA #<RULE_TOP_OFFSET
-  STA TEXT_OFFSET
-  LDA #>RULE_TOP_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_RULE
-
-  ; Row 9: Start prompt
-  LDA #<START_PROMPT_TEXT
-  STA TEXT_SOURCE
-  LDA #>START_PROMPT_TEXT
-  STA TEXT_SOURCE+1
-  LDA #<PROMPT_OFFSET
-  STA TEXT_OFFSET
-  LDA #>PROMPT_OFFSET
-  STA TEXT_OFFSET+1
-  JSR DRAW_TEXT_AT
-  RTS
-
-; ---------------------------------------------------------------------------
-; DISPLAY LIST
-; ---------------------------------------------------------------------------
 MY_DISPLAY_LIST:
-  .BYTE $70,$70,$F0     ; 24 blank lines (last 8 have DLI bit set via $F0)
-  .BYTE $46             ; Row 0: Antic Mode 6 (GR.1) + LMS
-  .WORD $BC00           ; Screen RAM address (patched later)
-  .BYTE $00             ; 8 Blank scanlines
-  .BYTE $02             ; Row 1: Antic Mode 2 (GR.0) - Top Rule
-  .BYTE $02,$02,$02,$02 ; Row 2-5: GR.0
-  .BYTE $02,$02,$02     ; Row 6-8: GR.0
-  .BYTE $06             ; Row 9: Antic Mode 6 (GR.1) - PROMPT ROW
-  .BYTE $02,$02,$02,$02 ; Row 10-13: GR.0
-  .BYTE $02,$02,$02,$02 ; Row 14-17: GR.0
-  .BYTE $02,$02         ; Row 18-19: GR.0
-  .BYTE $41             ; JMP and Wait for VBLANK
+  .BYTE $F0              ; 8 blank scanlines, DLI sets bitmap palettes
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0000
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0028
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0050
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0078
+  .BYTE $4E
+  .WORD BITMAP_DATA+$00A0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$00C8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$00F0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0118
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0140
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0168
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0190
+  .BYTE $4E
+  .WORD BITMAP_DATA+$01B8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$01E0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0208
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0230
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0258
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0280
+  .BYTE $4E
+  .WORD BITMAP_DATA+$02A8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$02D0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$02F8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0320
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0348
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0370
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0398
+  .BYTE $4E
+  .WORD BITMAP_DATA+$03C0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$03E8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0410
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0438
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0460
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0488
+  .BYTE $4E
+  .WORD BITMAP_DATA+$04B0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$04D8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0500
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0528
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0550
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0578
+  .BYTE $4E
+  .WORD BITMAP_DATA+$05A0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$05C8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$05F0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0618
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0640
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0668
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0690
+  .BYTE $4E
+  .WORD BITMAP_DATA+$06B8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$06E0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0708
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0730
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0758
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0780
+  .BYTE $4E
+  .WORD BITMAP_DATA+$07A8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$07D0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$07F8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0820
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0848
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0870
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0898
+  .BYTE $4E
+  .WORD BITMAP_DATA+$08C0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$08E8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0910
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0938
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0960
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0988
+  .BYTE $4E
+  .WORD BITMAP_DATA+$09B0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$09D8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0A00
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0A28
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0A50
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0A78
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0AA0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0AC8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0AF0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0B18
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0B40
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0B68
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0B90
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0BB8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0BE0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0C08
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0C30
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0C58
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0C80
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0CA8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0CD0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0CF8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0D20
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0D48
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0D70
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0D98
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0DC0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0DE8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0E10
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0E38
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0E60
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0E88
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0EB0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0ED8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0F00
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0F28
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0F50
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0F78
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0FA0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0FC8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$0FF0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1018
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1040
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1068
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1090
+  .BYTE $4E
+  .WORD BITMAP_DATA+$10B8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$10E0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1108
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1130
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1158
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1180
+  .BYTE $4E
+  .WORD BITMAP_DATA+$11A8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$11D0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$11F8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1220
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1248
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1270
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1298
+  .BYTE $4E
+  .WORD BITMAP_DATA+$12C0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$12E8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1310
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1338
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1360
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1388
+  .BYTE $4E
+  .WORD BITMAP_DATA+$13B0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$13D8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1400
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1428
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1450
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1478
+  .BYTE $4E
+  .WORD BITMAP_DATA+$14A0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$14C8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$14F0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1518
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1540
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1568
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1590
+  .BYTE $4E
+  .WORD BITMAP_DATA+$15B8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$15E0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1608
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1630
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1658
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1680
+  .BYTE $4E
+  .WORD BITMAP_DATA+$16A8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$16D0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$16F8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1720
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1748
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1770
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1798
+  .BYTE $4E
+  .WORD BITMAP_DATA+$17C0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$17E8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1810
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1838
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1860
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1888
+  .BYTE $4E
+  .WORD BITMAP_DATA+$18B0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$18D8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1900
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1928
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1950
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1978
+  .BYTE $4E
+  .WORD BITMAP_DATA+$19A0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$19C8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$19F0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1A18
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1A40
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1A68
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1A90
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1AB8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1AE0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1B08
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1B30
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1B58
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1B80
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1BA8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1BD0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1BF8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1C20
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1C48
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1C70
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1C98
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1CC0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1CE8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1D10
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1D38
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1D60
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1D88
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1DB0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1DD8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1E00
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1E28
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1E50
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1E78
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1EA0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1EC8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1EF0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1F18
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1F40
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1F68
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1F90
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1FB8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$1FE0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2008
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2030
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2058
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2080
+  .BYTE $4E
+  .WORD BITMAP_DATA+$20A8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$20D0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$20F8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2120
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2148
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2170
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2198
+  .BYTE $4E
+  .WORD BITMAP_DATA+$21C0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$21E8
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2210
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2238
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2260
+  .BYTE $4E
+  .WORD BITMAP_DATA+$2288
+  .BYTE $4E
+  .WORD BITMAP_DATA+$22B0
+  .BYTE $4E
+  .WORD BITMAP_DATA+$22D8
+  .BYTE $41
   .WORD MY_DISPLAY_LIST
 
-; We need to patch the LMS address in the Display List to match SAVMSC
-PATCH_DL:
-  LDA SAVMSC
-  STA MY_DISPLAY_LIST+4
-  LDA SAVMSC+1
-  STA MY_DISPLAY_LIST+5
-  RTS
+.ORG $3000
 
+BITMAP_DATA:
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0A,$AA,$AA,$AA,$AA,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$56,$AA,$AA,$AA,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$55,$55,$AA,$AA,$AA,$FF,$FF,$F0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$03,$FF,$FF,$AA,$AA,$AA,$95,$55,$55,$55,$55,$55
+  .BYTE $AA,$AA,$FF,$FF,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55,$7F,$FF,$AA,$AA
+  .BYTE $A8,$00,$01,$55,$55,$50,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$55,$55,$00,$00,$AA
+  .BYTE $80,$10,$15,$55,$55,$55,$55,$55,$41,$41,$40,$00,$00,$40,$00,$00,$00,$00,$00,$55,$15,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$15,$55,$55,$55,$55,$55,$00,$02
+  .BYTE $85,$55,$55,$00,$04,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$14,$00,$05,$55,$55,$56
+  .BYTE $85,$55,$51,$54,$01,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$40,$00,$00,$00,$00,$00,$40,$14,$00,$01,$55,$55,$52
+  .BYTE $85,$54,$51,$40,$15,$00,$00,$00,$01,$00,$00,$00,$00,$40,$00,$00,$00,$00,$01,$00,$01,$40,$00,$14,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$54,$15,$55,$55,$52
+  .BYTE $95,$55,$44,$01,$55,$00,$04,$00,$14,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$14,$01,$05,$15,$52
+  .BYTE $95,$54,$05,$15,$00,$00,$00,$04,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$01,$15,$52
+  .BYTE $40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01
+  .BYTE $55,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$11
+  .BYTE $55,$04,$04,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$51
+  .BYTE $45,$00,$00,$04,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$00,$00,$51
+  .BYTE $45,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$40,$00,$11
+  .BYTE $40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$11
+  .BYTE $40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$11
+  .BYTE $40,$01,$00,$04,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01
+  .BYTE $44,$55,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$51
+  .BYTE $44,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$51,$55,$54,$50,$01,$15,$55,$00,$15,$54,$04,$40,$00,$00,$00,$01,$00,$00,$00,$00,$00,$00,$00,$00,$51
+  .BYTE $40,$14,$00,$00,$00,$00,$00,$00,$00,$01,$54,$14,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$45,$55,$01,$55,$00,$00,$00,$00,$00,$00,$00,$00,$01
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $C0,$00,$C0,$00,$00,$00,$00,$3C,$00,$0E,$AA,$AA,$00,$00,$02,$55,$55,$55,$56,$02,$55,$55,$C0,$95,$57,$36,$AA,$AA,$AA,$CA,$FF,$C0,$FC,$00,$00,$00,$00,$00,$00,$03
+  .BYTE $00,$00,$00,$00,$00,$0D,$55,$57,$00,$0D,$55,$55,$C0,$00,$03,$6A,$AA,$AA,$A9,$0D,$AA,$AA,$40,$6A,$A7,$36,$99,$55,$55,$C5,$55,$40,$D5,$55,$70,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$0E,$AA,$AB,$00,$0E,$55,$56,$C0,$00,$03,$55,$55,$55,$57,$0E,$55,$55,$80,$D5,$5B,$39,$55,$F5,$56,$C9,$55,$80,$EA,$AA,$B0,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$0D,$55,$57,$00,$0D,$95,$59,$C0,$00,$03,$6A,$AA,$AA,$A7,$0D,$AA,$A9,$F0,$DA,$A7,$06,$A9,$F6,$AB,$0D,$56,$C3,$D5,$55,$70,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$2B,$55,$5E,$80,$2B,$55,$57,$A0,$00,$02,$D5,$55,$55,$5E,$AB,$55,$55,$E0,$B5,$5E,$2D,$57,$AD,$56,$8B,$57,$A2,$B5,$55,$E8,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$55,$6C,$00,$03,$95,$6C,$00,$00,$E5,$55,$56,$C0,$00,$00,$0E,$AC,$00,$00,$E9,$B0,$0E,$5C,$03,$AC,$02,$AB,$03,$AA,$C0,$00,$39,$55,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$55,$AC,$00,$03,$A5,$AC,$00,$00,$E9,$55,$56,$C0,$00,$00,$0E,$AC,$00,$00,$39,$B0,$0E,$A8,$03,$AC,$0E,$AB,$03,$AA,$C0,$00,$3A,$55,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$80,$00,$00,$AF,$80,$00,$00,$2B,$55,$57,$80,$00,$00,$02,$A0,$00,$00,$0A,$80,$02,$F8,$00,$A0,$02,$A8,$00,$A8,$00,$00,$02,$D5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$80,$00,$00,$EA,$80,$00,$00,$3A,$55,$56,$C0,$00,$00,$0E,$B0,$00,$00,$0E,$B0,$03,$AC,$03,$AC,$03,$AC,$03,$AC,$00,$00,$0E,$95,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$80,$00,$00,$2F,$80,$00,$00,$0B,$55,$57,$80,$00,$00,$0B,$80,$00,$00,$0B,$E0,$02,$F8,$02,$F8,$02,$F8,$02,$F8,$00,$00,$02,$D5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$80,$2A,$00,$2F,$80,$2A,$80,$0B,$55,$57,$AA,$A0,$2A,$AB,$C0,$0A,$A0,$0B,$E0,$02,$F8,$02,$F8,$03,$F8,$0B,$F8,$00,$A8,$02,$D5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$3F,$C0,$3A,$C0,$3F,$F0,$0E,$55,$56,$AA,$B0,$0E,$AA,$C0,$3A,$B0,$0E,$B0,$00,$AC,$03,$AC,$02,$B0,$0E,$AC,$03,$FC,$03,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$C0,$3A,$C0,$3A,$B0,$0E,$55,$55,$AA,$B0,$0A,$AA,$C0,$3A,$B0,$0E,$B0,$00,$EC,$03,$AC,$03,$B0,$0E,$AC,$03,$AB,$03,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$80,$3A,$C0,$3A,$B0,$0E,$55,$55,$6A,$B0,$0A,$AA,$C0,$3A,$B0,$0E,$B0,$00,$EC,$03,$AC,$02,$B0,$0E,$AC,$02,$AB,$03,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$C0,$3A,$C0,$3A,$B0,$0E,$55,$55,$6A,$B0,$0A,$AA,$C0,$3A,$B0,$0E,$B0,$00,$EC,$03,$AC,$03,$B0,$3A,$AC,$02,$A8,$03,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$C0,$3A,$C0,$3A,$B0,$0E,$55,$55,$6A,$B0,$0A,$AA,$C0,$3A,$B0,$0E,$B0,$00,$3C,$03,$AC,$03,$C0,$3A,$AC,$02,$AB,$03,$A5,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$02,$55,$EA,$D5,$7A,$D5,$7A,$B5,$5E,$80,$00,$00,$B5,$5A,$02,$D5,$7A,$A5,$5E,$B5,$55,$7D,$57,$AD,$57,$D5,$7A,$AD,$56,$AB,$FF,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$BC,$95,$6F,$95,$6C,$E5,$5B,$00,$00,$00,$D5,$5B,$00,$95,$6F,$25,$5B,$E5,$55,$69,$56,$F9,$56,$95,$7F,$39,$57,$CE,$AA,$F0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$E8,$D5,$7A,$D5,$7A,$B5,$5E,$00,$00,$00,$B5,$5A,$00,$D5,$7A,$35,$5E,$B5,$55,$7D,$57,$AD,$57,$55,$EA,$2D,$56,$8A,$AA,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$E8,$D5,$7A,$D5,$7A,$B5,$5E,$00,$00,$00,$B5,$5A,$00,$D5,$7A,$35,$5E,$B5,$55,$5D,$57,$AD,$57,$55,$EA,$2D,$56,$AA,$AA,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$E8,$D5,$7A,$D5,$7F,$D5,$7A,$00,$00,$00,$B5,$5A,$00,$D5,$7A,$25,$5E,$B5,$55,$5D,$57,$AD,$57,$57,$A8,$2D,$57,$FF,$EA,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$E8,$95,$7A,$B5,$5F,$D5,$FA,$00,$00,$00,$B5,$5A,$00,$95,$7A,$A5,$5E,$B5,$55,$5D,$57,$AD,$55,$57,$A8,$2D,$57,$FF,$EA,$A0,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$C0,$3A,$B0,$00,$00,$EA,$55,$55,$55,$B0,$0A,$55,$C0,$3A,$A0,$0E,$B0,$00,$00,$03,$AC,$00,$03,$A9,$6C,$00,$00,$39,$55,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$EA,$C0,$3A,$AC,$00,$03,$EA,$55,$55,$55,$B0,$0A,$55,$C0,$3A,$B0,$0E,$B0,$00,$00,$03,$AC,$00,$03,$A9,$6B,$00,$00,$3A,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$03,$55,$AA,$95,$6F,$F9,$55,$56,$BF,$00,$00,$00,$E5,$5F,$00,$95,$6A,$A5,$5B,$E5,$59,$55,$56,$F9,$55,$56,$F0,$0E,$55,$55,$5B,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$5E,$00,$00,$00,$0A,$A0,$00,$00,$2B,$55,$55,$55,$80,$0A,$57,$80,$00,$00,$02,$80,$00,$00,$00,$A0,$00,$00,$A5,$5A,$00,$00,$02,$D5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5E,$00,$00,$00,$0A,$80,$00,$00,$0B,$55,$55,$57,$80,$0A,$D7,$80,$00,$00,$02,$80,$00,$00,$00,$A0,$00,$00,$A5,$5E,$80,$00,$02,$B5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5E,$00,$00,$00,$0A,$80,$00,$00,$0B,$55,$55,$57,$80,$0A,$D7,$80,$00,$00,$02,$80,$08,$00,$00,$A0,$00,$00,$25,$56,$80,$00,$00,$B5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5E,$00,$00,$00,$0A,$00,$00,$00,$0B,$55,$55,$55,$80,$0A,$57,$80,$00,$00,$02,$80,$08,$00,$00,$A0,$00,$00,$2D,$57,$80,$00,$00,$B5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$56,$00,$00,$00,$3A,$C0,$3A,$B0,$0E,$55,$55,$55,$B0,$0A,$55,$C0,$00,$00,$0E,$B0,$0E,$00,$03,$AC,$03,$C0,$E9,$55,$AF,$FC,$00,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$00,$00,$00,$3A,$C0,$3A,$B0,$0E,$55,$55,$55,$80,$0A,$55,$C0,$00,$00,$0E,$B0,$0E,$00,$03,$AC,$03,$C0,$39,$55,$6A,$AB,$00,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$00,$00,$00,$3A,$C0,$3A,$B0,$0E,$55,$55,$55,$80,$0A,$55,$C0,$00,$00,$0E,$B0,$0E,$C0,$03,$AC,$03,$C0,$39,$6A,$AA,$AB,$00,$A5,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$02,$55,$FF,$D5,$7A,$D5,$6A,$B5,$5E,$00,$00,$00,$B5,$5A,$00,$95,$7F,$F5,$5E,$B5,$5E,$D5,$57,$AD,$57,$B5,$78,$2A,$AA,$AB,$55,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$02,$55,$AA,$95,$6F,$95,$6F,$E5,$5B,$00,$00,$00,$E5,$5F,$00,$95,$6F,$E5,$5B,$E5,$5B,$95,$56,$F9,$56,$D5,$6F,$3A,$AA,$FE,$55,$F0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$03,$55,$EA,$D5,$7A,$D5,$78,$B5,$5E,$00,$00,$00,$95,$5A,$00,$D5,$7A,$B5,$5E,$B5,$5E,$B5,$57,$AD,$57,$B5,$5E,$2D,$57,$AB,$55,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$03,$55,$EA,$D5,$7A,$D5,$78,$B5,$5E,$00,$00,$00,$95,$5A,$00,$D5,$7A,$B5,$5E,$B5,$5E,$B5,$57,$AD,$57,$B5,$5E,$2D,$57,$8B,$55,$E0,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$57,$00,$EA,$C0,$3A,$00,$3A,$B0,$0E,$55,$55,$55,$80,$0A,$55,$C0,$3A,$B0,$0E,$B0,$0E,$B0,$00,$AC,$03,$B0,$0E,$AC,$03,$9B,$00,$E5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$00,$EA,$C0,$3A,$00,$3A,$B0,$0E,$55,$55,$55,$80,$0A,$55,$C0,$3A,$B0,$0E,$B0,$0E,$B0,$00,$AC,$03,$AC,$03,$AC,$03,$AB,$00,$E5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$00,$EA,$C0,$3A,$00,$3F,$C0,$0E,$55,$55,$55,$80,$0A,$55,$C0,$0A,$70,$02,$B0,$0E,$A0,$00,$AC,$03,$AC,$03,$AC,$03,$A8,$00,$E5,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$02,$55,$BC,$95,$6F,$95,$6A,$95,$5B,$00,$00,$00,$E5,$5F,$00,$95,$6F,$25,$5B,$E5,$5B,$F9,$56,$F9,$56,$F9,$56,$F9,$56,$A9,$55,$B0,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$57,$00,$EA,$C0,$3A,$C0,$00,$00,$0E,$55,$55,$55,$B0,$0A,$55,$C0,$3A,$60,$0E,$B0,$0E,$AC,$03,$AC,$03,$A8,$03,$AC,$00,$FC,$00,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5B,$00,$EA,$C0,$3A,$C0,$00,$00,$3A,$55,$55,$55,$80,$0A,$56,$C0,$3A,$70,$0E,$B0,$0E,$A8,$03,$AC,$03,$AB,$00,$EC,$00,$00,$00,$E5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$57,$00,$EA,$C0,$3A,$F0,$00,$00,$3A,$55,$55,$55,$80,$0A,$55,$C0,$3A,$70,$0E,$B0,$0E,$58,$03,$AC,$03,$AB,$00,$EB,$00,$00,$03,$A5,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$03,$55,$EA,$D5,$7A,$B5,$55,$55,$EA,$00,$00,$00,$95,$5A,$00,$D5,$7A,$35,$5E,$B5,$5E,$09,$57,$AD,$57,$8B,$55,$EB,$55,$55,$5F,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$03,$55,$EA,$D5,$7A,$BD,$55,$55,$EA,$00,$00,$00,$95,$5A,$00,$D5,$7A,$35,$5E,$B5,$5E,$09,$57,$AD,$57,$8B,$55,$EA,$D5,$55,$5E,$A0,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$03,$55,$EA,$D5,$7A,$2D,$55,$57,$EA,$00,$00,$00,$95,$5A,$00,$D5,$7A,$35,$5E,$B5,$5E,$0D,$55,$AD,$57,$8B,$55,$EA,$D5,$55,$5E,$A0,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$5B,$00,$2A,$C0,$0A,$6C,$00,$00,$AA,$55,$55,$55,$80,$0E,$55,$C0,$0A,$70,$02,$80,$0E,$5C,$00,$A0,$03,$9B,$00,$EA,$C0,$00,$0A,$A5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5C,$00,$2F,$00,$0B,$78,$00,$00,$A9,$55,$55,$55,$80,$0A,$57,$80,$0B,$E0,$02,$80,$02,$D8,$00,$A0,$00,$BC,$00,$2F,$80,$00,$0A,$B5,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5E,$AA,$8F,$2A,$A3,$50,$00,$00,$0D,$55,$55,$55,$00,$00,$57,$00,$03,$C0,$00,$00,$00,$D0,$00,$00,$00,$3C,$AA,$8D,$2A,$AA,$A0,$15,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$5E,$00,$0B,$80,$02,$58,$00,$00,$0D,$55,$55,$55,$E0,$00,$D5,$C0,$02,$78,$00,$20,$00,$9E,$00,$08,$00,$2E,$00,$09,$80,$00,$00,$D5,$55,$55,$55,$55
+  .BYTE $D5,$55,$55,$55,$55,$80,$09,$40,$02,$5C,$00,$00,$25,$55,$55,$55,$60,$00,$DD,$60,$02,$58,$00,$30,$00,$96,$00,$0C,$00,$27,$00,$09,$C0,$00,$02,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$55,$58,$15,$56,$02,$55,$55,$70,$00,$00,$00,$35,$55,$C0,$25,$56,$09,$55,$75,$55,$82,$55,$51,$55,$63,$55,$58,$35,$55,$57,$00,$00,$00,$00,$00
+  .BYTE $30,$00,$00,$00,$00,$AA,$A4,$2A,$A9,$03,$95,$55,$40,$00,$00,$00,$35,$55,$C0,$35,$57,$0D,$55,$75,$55,$C3,$55,$5D,$AA,$B3,$AA,$AC,$CA,$AA,$AB,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$15,$45,$40,$00,$00,$00,$04,$00,$00,$00,$00,$01,$55,$01,$54,$00,$40,$00,$05,$40,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$55,$55,$45,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55,$51,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$15,$55,$55,$55,$55,$56,$AA,$AA,$AA,$AA,$AA,$AA,$AA,$AA,$A9,$55,$55,$55,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $AA,$A5,$55,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$11,$55,$55,$55,$AA,$AA
+  .BYTE $AA,$AA,$AA,$AA,$95,$55,$55,$55,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$15,$55,$55,$55,$55,$5A,$AA,$AA,$AA,$AA
+  .BYTE $55,$55,$55,$55,$55,$55,$5A,$AA,$AA,$AA,$AA,$AA,$AA,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$AA,$AA,$AA,$AA,$AA,$AA,$95,$55,$55,$55,$55,$55,$55
+  .BYTE $45,$55,$55,$55,$55,$55,$55,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$55,$55,$55,$55,$55,$55,$54,$00,$00
+  .BYTE $55,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55
+  .BYTE $55,$55,$55,$55,$5A,$AA,$AA,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$AA,$AA,$AA,$55,$55,$55,$55,$55
+  .BYTE $55,$55,$55,$55,$55,$AA,$A8,$00,$0A,$00,$80,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$2A,$00,$00,$00,$00,$00,$00,$0A,$AA,$A8,$AA,$AA,$A9,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$06,$15,$55,$55,$41,$55,$01,$55,$55,$55,$51,$40,$04,$00,$05,$15,$10,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$25,$00,$00,$00,$25,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$55,$00,$00,$15,$00,$00,$00,$00,$00,$01,$AA,$40,$00,$00,$2A,$AA,$80,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$40,$00,$40,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$55,$80,$00,$00,$15,$55,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$69,$80,$00,$00,$95,$55,$60,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$55,$80,$00,$00,$B5,$55,$60,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$55,$80,$00,$00,$95,$55,$60,$56,$00,$00,$00,$00,$00,$00,$00,$00,$20,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$70,$C0,$00,$0A,$D5,$55,$55,$7F,$AA,$00,$00,$00,$00,$00,$00,$02,$D4,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0A,$C0,$02,$AD,$55,$55,$55,$75,$57,$A0,$00,$00,$00,$02,$AA,$AD,$57,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$80,$40,$21,$5F,$FD,$55,$55,$57,$FF,$4A,$AA,$8A,$AA,$A9,$55,$5F,$FD,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$40,$3A,$A5,$69,$55,$55,$55,$55,$9F,$FF,$D7,$FF,$FE,$AA,$A9,$69,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$40,$19,$55,$65,$55,$55,$55,$55,$9E,$AA,$AA,$AA,$A9,$55,$59,$69,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$10,$05,$55,$65,$55,$55,$55,$55,$99,$65,$59,$55,$55,$56,$FF,$EE,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$F0,$3A,$AA,$A5,$55,$55,$55,$55,$A9,$65,$59,$55,$5A,$AA,$3C,$63,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$A0,$25,$55,$55,$55,$55,$55,$55,$55,$56,$65,$55,$54,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$F0,$39,$55,$A9,$55,$55,$55,$56,$A9,$6A,$A9,$55,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0C,$C9,$55,$A5,$55,$55,$55,$56,$9A,$AA,$A7,$FF,$F0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$1C,$C9,$55,$A9,$55,$55,$55,$5A,$AA,$AF,$FC,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$20,$25,$55,$55,$55,$55,$55,$55,$58,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$B0,$35,$55,$55,$55,$55,$55,$55,$5A,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$10,$0E,$AB,$A5,$55,$55,$55,$65,$91,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$2C,$3A,$A9,$56,$AA,$55,$55,$55,$69,$55,$EC,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$E0,$0F,$FE,$56,$AA,$55,$55,$55,$56,$AA,$5B,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$24,$00,$02,$FF,$FF,$EA,$AA,$AA,$AA,$AA,$AD,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$13,$F6,$AA,$A5,$55,$55,$55,$55,$55,$55,$59,$01,$80,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0A,$95,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$5D,$70,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0A,$AA,$A5,$55,$55,$55,$55,$55,$55,$55,$55,$5A,$A5,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$1A,$95,$55,$55,$55,$55,$55,$55,$55,$55,$55,$56,$56,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$E5,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$56,$AA,$AB,$C0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$E5,$55,$55,$AA,$A5,$55,$55,$55,$55,$55,$AA,$AA,$95,$56,$80,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$25,$6E,$FE,$AA,$A5,$55,$5A,$AA,$AA,$AA,$55,$55,$55,$55,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $01,$01,$14,$50,$55,$55,$11,$40,$11,$15,$04,$15,$47,$EA,$AA,$AA,$FF,$EA,$AA,$AA,$AA,$AA,$AA,$FA,$AA,$AA,$AB,$E0,$55,$41,$50,$44,$54,$41,$01,$10,$00,$00,$10,$04
+  .BYTE $14,$00,$15,$44,$00,$00,$01,$04,$04,$45,$55,$50,$46,$BB,$FF,$FA,$AA,$AA,$AA,$BF,$FF,$FF,$FF,$EA,$AA,$AA,$AA,$FC,$15,$45,$45,$01,$50,$05,$00,$11,$55,$44,$00,$04
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$AA,$AA,$AA,$AA,$BF,$FF,$FF,$FF,$D5,$55,$55,$55,$55,$55,$BC,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$59,$55,$5F,$FF,$F5,$55,$55,$55,$6A,$AA,$AA,$AA,$A9,$56,$BC,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$D6,$AA,$AA,$7F,$F5,$55,$55,$55,$55,$55,$55,$55,$56,$A9,$7A,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$6A,$AA,$AD,$55,$55,$55,$55,$55,$55,$55,$55,$B5,$5A,$AA,$58,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$A9,$55,$55,$55,$55,$55,$55,$55,$69,$55,$56,$25,$5A,$E6,$98,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$03,$95,$55,$55,$55,$55,$57,$55,$55,$69,$55,$57,$25,$71,$E6,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0B,$95,$55,$55,$55,$55,$58,$95,$55,$82,$55,$56,$35,$63,$FC,$D8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$3A,$55,$55,$55,$A5,$55,$5C,$95,$55,$7E,$55,$55,$25,$6B,$F2,$98,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$29,$55,$55,$55,$35,$55,$58,$95,$55,$6D,$55,$55,$55,$76,$3D,$98,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$F9,$55,$55,$56,$35,$55,$58,$95,$55,$55,$55,$55,$55,$76,$0D,$98,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$E9,$6A,$95,$56,$35,$55,$56,$55,$55,$55,$55,$55,$55,$7B,$0E,$D8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$9D,$7A,$95,$55,$B5,$55,$55,$55,$55,$55,$55,$55,$55,$7A,$EE,$DC,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0D,$AA,$B5,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$61,$B7,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$09,$B7,$A5,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$59,$66,$D0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$09,$AF,$69,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$5A,$BE,$60,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$90,$A9,$55,$55,$55,$55,$55,$55,$55,$55,$55,$57,$56,$09,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$AF,$B9,$55,$55,$55,$55,$55,$55,$55,$55,$69,$5B,$95,$A5,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$FF,$A9,$55,$55,$55,$55,$55,$5A,$96,$F5,$B2,$6F,$D6,$55,$C0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0F,$BA,$FD,$55,$55,$55,$F5,$6B,$58,$96,$0D,$8A,$72,$38,$57,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$09,$FF,$E5,$55,$5F,$D7,$25,$EB,$7A,$96,$AD,$AA,$7A,$BB,$5C,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $14,$15,$54,$50,$00,$00,$00,$05,$15,$00,$00,$05,$46,$FB,$9A,$B6,$AC,$EB,$5E,$D5,$B5,$69,$5E,$D7,$B5,$6A,$A4,$40,$00,$05,$54,$14,$00,$00,$15,$40,$01,$41,$55,$54
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$BD,$FE,$D5,$B5,$69,$56,$55,$B5,$69,$5E,$55,$B5,$6A,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$E5,$62,$95,$E5,$6D,$5B,$55,$E5,$6D,$5B,$55,$F4,$BF,$80,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$03,$55,$82,$8F,$63,$27,$CD,$CF,$63,$E7,$09,$82,$5A,$96,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$95,$82,$8F,$63,$24,$F9,$83,$5C,$96,$F5,$69,$55,$58,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$35,$5D,$EA,$5A,$97,$25,$6B,$57,$55,$55,$55,$55,$5C,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $AA,$AA,$A8,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$09,$55,$C2,$58,$97,$B5,$7D,$55,$55,$55,$55,$55,$E0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0A,$AA,$AA
+  .BYTE $AA,$AA,$AA,$80,$00,$00,$00,$00,$15,$55,$55,$55,$55,$56,$FF,$C2,$FE,$BF,$FF,$FF,$FF,$FF,$FA,$AA,$AA,$15,$55,$55,$55,$55,$54,$00,$00,$00,$00,$00,$08,$AA,$AA,$AA
+  .BYTE $00,$00,$00,$00,$00,$05,$55,$55,$55,$55,$55,$50,$05,$54,$7A,$AA,$AA,$AA,$AA,$AA,$FF,$FF,$F0,$00,$00,$14,$00,$05,$55,$55,$55,$50,$55,$55,$45,$55,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$55,$55,$55,$55,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$AA,$AA,$45,$41,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $55,$55,$55,$54,$00,$00,$44,$50,$40,$00,$00,$82,$28,$A0,$00,$FF,$FF,$8A,$00,$02,$82,$2A,$A0,$82,$AA,$8A,$80,$82,$84,$11,$00,$10,$50,$50,$45,$54,$55,$55,$55,$55
+  .BYTE $10,$41,$41,$14,$00,$05,$40,$01,$44,$05,$51,$10,$00,$05,$55,$54,$55,$40,$11,$40,$04,$40,$04,$14,$04,$00,$11,$54,$00,$00,$15,$00,$51,$40,$40,$04,$11,$01,$44,$00
+  .BYTE $40,$15,$10,$40,$00,$14,$44,$10,$41,$14,$55,$44,$10,$55,$54,$11,$05,$50,$05,$50,$41,$14,$11,$04,$55,$40,$04,$51,$04,$00,$05,$10,$40,$40,$00,$00,$00,$01,$00,$01
+  .BYTE $55,$00,$55,$55,$11,$00,$44,$40,$45,$04,$40,$45,$11,$01,$00,$41,$00,$00,$00,$00,$50,$00,$10,$00,$00,$05,$50,$00,$04,$14,$40,$14,$40,$00,$45,$04,$51,$05,$55,$55
+  .BYTE $10,$51,$45,$01,$40,$00,$00,$00,$00,$40,$11,$10,$44,$14,$51,$04,$51,$55,$11,$55,$04,$45,$44,$51,$54,$10,$01,$15,$50,$00,$00,$40,$00,$00,$00,$00,$11,$01,$04,$40
+  .BYTE $14,$05,$45,$55,$55,$55,$11,$05,$10,$41,$00,$11,$44,$10,$01,$14,$40,$00,$11,$00,$04,$41,$04,$10,$00,$15,$41,$00,$11,$45,$00,$05,$11,$05,$15,$55,$55,$55,$54,$14
+  .BYTE $05,$50,$10,$00,$00,$00,$11,$10,$00,$51,$04,$00,$00,$10,$00,$00,$54,$10,$04,$45,$01,$00,$00,$15,$00,$00,$00,$04,$51,$00,$00,$45,$10,$00,$00,$00,$00,$00,$01,$40
+  .BYTE $14,$40,$45,$10,$51,$00,$04,$45,$00,$51,$10,$10,$44,$54,$45,$04,$51,$45,$51,$45,$14,$45,$44,$55,$55,$11,$01,$15,$51,$04,$04,$14,$40,$04,$50,$04,$11,$01,$04,$50
+  .BYTE $05,$00,$00,$40,$14,$40,$44,$40,$01,$04,$40,$44,$11,$40,$14,$51,$14,$11,$54,$11,$51,$14,$51,$04,$15,$45,$00,$41,$04,$50,$40,$15,$44,$00,$44,$00,$54,$00,$00,$41
+  .BYTE $15,$40,$00,$40,$04,$00,$11,$01,$04,$55,$04,$10,$55,$54,$55,$55,$55,$51,$54,$11,$55,$10,$14,$15,$55,$54,$00,$14,$51,$55,$00,$45,$00,$01,$00,$41,$44,$00,$00,$00
+  .BYTE $41,$11,$10,$00,$05,$55,$01,$55,$55,$04,$00,$44,$00,$00,$04,$51,$00,$10,$05,$10,$41,$14,$11,$04,$50,$45,$14,$41,$04,$00,$55,$54,$05,$55,$05,$44,$45,$55,$55,$41
+  .BYTE $15,$55,$44,$00,$45,$54,$11,$55,$14,$41,$05,$11,$44,$14,$01,$10,$00,$44,$00,$01,$00,$41,$04,$10,$00,$10,$45,$14,$51,$01,$55,$55,$11,$55,$55,$50,$40,$00,$55,$54
+  .BYTE $40,$11,$10,$01,$44,$55,$55,$05,$50,$51,$14,$45,$14,$45,$54,$41,$55,$11,$45,$50,$40,$11,$51,$45,$00,$04,$10,$10,$04,$55,$00,$41,$05,$55,$00,$50,$44,$54,$00,$00
+  .BYTE $00,$00,$40,$45,$41,$55,$51,$45,$50,$01,$05,$00,$44,$10,$00,$04,$50,$04,$11,$00,$04,$41,$04,$10,$00,$10,$40,$04,$51,$05,$10,$05,$11,$55,$55,$51,$10,$00,$00,$00
+  .BYTE $AA,$AA,$AA,$00,$00,$00,$00,$11,$05,$04,$01,$44,$10,$14,$00,$01,$54,$40,$11,$01,$05,$05,$05,$14,$54,$45,$54,$41,$55,$54,$45,$04,$44,$00,$00,$00,$8A,$AA,$AA,$AA
+  .BYTE $55,$55,$55,$55,$55,$AA,$AA,$AA,$AA,$AA,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$80,$0A,$AA,$AA,$9A,$A9,$55,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$04,$00,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$55,$44,$00,$55,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$15,$55,$55,$55,$55,$55,$54,$55,$55,$55,$54,$01,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$00,$00,$00,$51,$00,$05,$00,$00,$00,$00,$54,$45,$40,$01,$14,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$04,$15,$00,$04,$40,$00,$00,$01,$55,$05,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$15,$55,$41,$55,$55,$41,$45,$41,$55,$41,$55,$45,$01,$41,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$40,$00,$00,$00,$00,$15,$50,$55,$55,$55,$54,$55,$55,$55,$51,$55,$55,$55,$55,$01,$55,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$45,$55,$55,$55,$50,$15,$55,$55,$55,$55,$54,$00,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55,$55,$55,$54,$15,$55,$54,$55,$55,$55,$45,$55,$55,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$55,$55,$55,$55,$55,$15,$45,$55,$54,$55,$55,$05,$55,$54,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$52,$90,$29,$28,$4A,$15,$54,$A1,$80,$52,$42,$84,$08,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$95,$A5,$69,$54,$D6,$35,$80,$02,$5C,$55,$8D,$05,$71,$56,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$D9,$B6,$6D,$A8,$96,$25,$80,$02,$58,$96,$C5,$C5,$92,$58,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$92,$64,$99,$C3,$79,$DB,$7F,$CD,$87,$14,$26,$46,$18,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$9B,$64,$D9,$A2,$60,$1C,$00,$01,$C0,$34,$1C,$77,$98,$D0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$0C,$D5,$B5,$6D,$58,$96,$25,$8C,$32,$58,$24,$1B,$75,$60,$93,$C0,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$9A,$25,$41,$A0,$29,$0A,$40,$00,$A4,$24,$15,$65,$60,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$23,$19,$82,$3C,$76,$10,$80,$01,$09,$DB,$25,$99,$90,$60,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$DC,$34,$61,$A8,$65,$1A,$40,$01,$64,$24,$1C,$77,$90,$90,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$14,$74,$19,$E6,$A8,$EB,$3A,$C5,$53,$AC,$38,$6D,$9B,$64,$F1,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$00,$01,$00,$40,$15,$54,$01,$40,$41,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$10,$14,$11,$54,$10,$00,$05,$50,$51,$40,$54,$04,$10,$50,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01
+  .BYTE $15,$40,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$54
+  .BYTE $A8,$00,$15,$55,$54,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$01,$55,$54,$00,$2A
+  .BYTE $AA,$AA,$AA,$BF,$FC,$00,$01,$55,$55,$55,$14,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$05,$55,$55,$50,$00,$0F,$FF,$EA,$AA,$AA
+  .BYTE $55,$55,$55,$55,$55,$55,$7F,$FF,$EA,$AA,$AA,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$02,$AA,$AA,$BF,$FF,$D5,$55,$55,$55,$55,$55
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$3F,$FF,$FA,$AA,$AA,$95,$55,$55,$55,$55,$55,$55,$55,$AA,$AA,$AB,$FF,$FF,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00,$00
 
-; =============================================================================
-; LOW-LEVEL DRAWING ROUTINES
-; =============================================================================
+.ORG $5400
 
-; ---------------------------------------------------------------------------
-; DRAW_TEXT_AT
-;   Write a zero-terminated screen-code string to the screen.
-;   Inputs:  TEXT_SOURCE (2 bytes) — address of string data
-;            TEXT_OFFSET (2 bytes) — byte offset from start of screen RAM
-;   Clobbers: A, Y
-;
-;   Implementation note: the addresses inside TEXT_LOAD and TEXT_STORE are
-;   patched at run time (self-modifying code), which is standard practice on
-;   the 6502 to avoid the overhead of indirect indexed addressing overhead.
-;   The $FFFF placeholders are overwritten before the loop executes.
-; ---------------------------------------------------------------------------
-DRAW_TEXT_AT:
-  LDA TEXT_SOURCE       ; patch source address into the LDA below
-  STA TEXT_LOAD+1
-  LDA TEXT_SOURCE+1
-  STA TEXT_LOAD+2
-
-  CLC
-  LDA SAVMSC            ; compute destination: screen_base + offset
-  ADC TEXT_OFFSET
-  STA TEXT_STORE+1      ; patch destination address into the STA below
-  LDA SAVMSC+1
-  ADC TEXT_OFFSET+1
-  STA TEXT_STORE+2
-
-  LDY #$00
-DRAW_TEXT_LOOP:
-TEXT_LOAD:
-  LDA $FFFF,Y           ; self-modified: reads from TEXT_SOURCE
-  CMP #$FF              ; $FF = end-of-string sentinel ($00 = space, can't use BEQ)
-  BEQ DRAW_TEXT_DONE
-TEXT_STORE:
-  STA $FFFF,Y           ; self-modified: writes to screen RAM
-  INY
-  BNE DRAW_TEXT_LOOP    ; Y wraps at 256 — keep strings under 255 chars
-
-DRAW_TEXT_DONE:
-  RTS
-
-; ---------------------------------------------------------------------------
-; DRAW_RULE
-;   Fill one full screen row (SCREEN_WIDTH bytes) with a repeated character.
-;   Inputs:  RULE_CHAR   — screen code of the fill character
-;            TEXT_OFFSET — byte offset from start of screen RAM (row start)
-;   Clobbers: A, Y
-; ---------------------------------------------------------------------------
-DRAW_RULE:
-  CLC
-  LDA SAVMSC
-  ADC TEXT_OFFSET
-  STA RULE_STORE+1      ; self-modify destination address
-  LDA SAVMSC+1
-  ADC TEXT_OFFSET+1
-  STA RULE_STORE+2
-
-  LDA RULE_CHAR
-  LDY #$00
-RULE_LOOP:
-RULE_STORE:
-  STA $FFFF,Y           ; self-modified: writes to screen RAM
-  INY
-  CPY #SCREEN_WIDTH     ; stop after 40 bytes (one full row)
-  BNE RULE_LOOP
-  RTS
-
-; ---------------------------------------------------------------------------
-; CLEAR_SCREEN
-;   Write $00 (space) to every byte of screen RAM.
-;   Walks row-by-row, advancing the self-modified pointer by SCREEN_WIDTH
-;   after each row.  Handles page crossing via BCC / INC.
-;   Clobbers: A, X, Y
-; ---------------------------------------------------------------------------
-CLEAR_SCREEN:
-  LDA SAVMSC
-  STA CLEAR_STORE+1
-  LDA SAVMSC+1
-  STA CLEAR_STORE+2
-
-  LDX #SCREEN_HEIGHT    ; outer loop: 24 rows
-CLEAR_ROW:
-  LDY #$00
-  LDA #$00
-CLEAR_COLUMN:
-CLEAR_STORE:
-  STA $FFFF,Y           ; self-modified: current row base address
-  INY
-  CPY #SCREEN_WIDTH
-  BNE CLEAR_COLUMN
-
-  CLC
-  LDA CLEAR_STORE+1     ; advance base address to next row
-  ADC #SCREEN_WIDTH
-  STA CLEAR_STORE+1
-  BCC CLEAR_NEXT_ROW
-  INC CLEAR_STORE+2     ; carry into high byte on page crossing
-
-CLEAR_NEXT_ROW:
-  DEX
-  BNE CLEAR_ROW
-  RTS
-
-; =============================================================================
-; GAME LOGIC STUBS
-; =============================================================================
-
-; ---------------------------------------------------------------------------
-; READ_INPUT — read joystick / keyboard into game state
-;   Joystick 0 port: $D300 (PORTA).  Bits 3-0: right/left/down/up (0=active).
-;   Joystick 1 port: $D300 bits 7-4.
-;   Fire button:     $D010 bit 2 (0=pressed).
-; ---------------------------------------------------------------------------
-READ_INPUT:
-  ; TODO: read PORTA ($D300), decode directions, update PLAYER_DIR / movement
-  RTS
-
-; ---------------------------------------------------------------------------
-; UPDATE_GAME — advance game simulation by one frame
-;   Called once per frame from GAME_LOOP.
-;   FRAME_COUNTER can be used for animation timing (e.g. mod 8 for blinking).
-; ---------------------------------------------------------------------------
-UPDATE_GAME:
-  INC FRAME_COUNTER
-  ; TODO: move tank, check collisions, update bullets
-  RTS
-
-; ---------------------------------------------------------------------------
-; DRAW_FRAME — render current game state to screen RAM
-;   Clear only dirty regions rather than the whole screen for speed.
-; ---------------------------------------------------------------------------
-DRAW_FRAME:
-  ; TODO: draw playfield tiles, tanks, bullets using DRAW_TEXT_AT / DRAW_RULE
-  RTS
-
-; =============================================================================
-; VARIABLES
-; =============================================================================
-
-PLAYER_X:
-  .BYTE $50             ; pixel / tile X position of player tank
-
-PLAYER_Y:
-  .BYTE $30             ; pixel / tile Y position of player tank
-
-PLAYER_DIR:
-  .BYTE $00             ; direction: 0=up  1=right  2=down  3=left
-
-FRAME_COUNTER:
-  .BYTE $00             ; incremented every frame; wraps at 255
-
-; Shared scratch used by DRAW_TEXT_AT and DRAW_RULE
-RULE_CHAR:
-  .BYTE $00             ; fill character for DRAW_RULE
-
-TEXT_SOURCE:
-  .BYTE $00,$00         ; lo, hi — pointer to string data
-
-TEXT_OFFSET:
-  .BYTE $00,$00         ; lo, hi — screen offset for current draw call
-
-; =============================================================================
-; STRING DATA  (Atari screen codes — see cheat-sheet at top of file)
-; =============================================================================
-
-; "* A8 TANKS *" — 12 chars
-;  *=10 ' '=0 A=33 8=24 ' '=0 T=52 A=33 N=46 K=43 S=51 ' '=0 *=10  $FF=end
-;  NOTE: $00 = space (not the terminator) — terminator is always $FF
-TITLE_TEXT:
-  .BYTE 10,0,33,24,0,52,33,46,43,51,0,10,$FF
-
-; "PRESS START" — 11 chars
-;  P=48 R=50 E=37 S=51 S=51 ' '=0 S=51 T=52 A=33 R=50 T=52  $FF=end
-START_PROMPT_TEXT:
-  .BYTE 48,50,37,51,51,0,51,52,33,50,52,$FF
+START_COLBK:
+  .BYTE $00,$00,$00,$84,$85,$84,$85,$85
+  .BYTE $85,$85,$85,$85,$85,$85,$85,$85
+  .BYTE $85,$85,$85,$85,$85,$85,$85,$85
+  .BYTE $85,$85,$85,$84,$85,$EB,$EB,$1A
+  .BYTE $EB,$EB,$EB,$EB,$EB,$EB,$EB,$EB
+  .BYTE $85,$84,$84,$84,$84,$84,$EB,$EB
+  .BYTE $84,$1A,$1A,$1A,$1A,$EB,$EB,$EB
+  .BYTE $84,$84,$84,$84,$EB,$EB,$1A,$84
+  .BYTE $EB,$EB,$EB,$84,$84,$84,$28,$27
+  .BYTE $01,$00,$00,$85,$85,$85,$85,$85
+  .BYTE $85,$85,$85,$84,$84,$09,$06,$08
+  .BYTE $08,$06,$1A,$19,$19,$19,$19,$19
+  .BYTE $19,$19,$19,$1A,$1B,$19,$1B,$1A
+  .BYTE $19,$EB,$EB,$EB,$EB,$EB,$EB,$EB
+  .BYTE $EB,$EB,$EB,$EB,$EB,$EB,$EB,$EB
+  .BYTE $EB,$EB,$EB,$1A,$19,$19,$19,$18
+  .BYTE $18,$18,$18,$18,$19,$18,$18,$18
+  .BYTE $18,$E8,$06,$06,$06,$06,$06,$06
+  .BYTE $07,$06,$06,$07,$06,$07,$07,$06
+  .BYTE $07,$07,$07,$07,$06,$06,$07,$06
+  .BYTE $04,$04,$04,$04,$05,$E4,$E4,$E5
+  .BYTE $E4,$E5,$E4,$E4,$E4,$E4,$E5,$E5
+  .BYTE $E4,$E4,$E4,$E4,$E2,$E2,$E2,$E2
+  .BYTE $E2,$E2,$E2,$E2,$E2,$E2,$E2,$E2
+  .BYTE $E2,$E2,$E2,$E2,$E2,$E2,$E2,$E2
+  .BYTE $E2,$E2,$E2,$E2,$E2,$E2,$E2,$E2
+  .BYTE $E2,$E2,$E2,$E2,$E2,$E2,$E2,$E2
+  .BYTE $E2,$E2,$E2,$E2,$E2,$E3,$00,$00
+START_PF0:
+  .BYTE $10,$10,$90,$00,$83,$85,$84,$84
+  .BYTE $84,$84,$84,$84,$83,$84,$84,$84
+  .BYTE $84,$84,$84,$84,$84,$84,$84,$00
+  .BYTE $02,$01,$27,$27,$1A,$84,$85,$85
+  .BYTE $85,$85,$85,$85,$84,$85,$85,$85
+  .BYTE $EB,$EB,$EB,$EB,$EB,$EB,$84,$85
+  .BYTE $EB,$85,$85,$85,$85,$85,$84,$84
+  .BYTE $EB,$EB,$EB,$EB,$84,$84,$84,$EB
+  .BYTE $84,$85,$84,$EB,$EB,$1B,$85,$85
+  .BYTE $85,$85,$85,$00,$92,$00,$84,$00
+  .BYTE $00,$00,$00,$85,$06,$08,$07,$06
+  .BYTE $09,$07,$07,$1A,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$19,$1A,$E0,$1A,$05
+  .BYTE $03,$02,$04,$01,$03,$05,$05,$05
+  .BYTE $06,$06,$04,$06,$05,$05,$05,$05
+  .BYTE $05,$03,$02,$19,$05,$04,$05,$05
+  .BYTE $05,$05,$05,$E9,$18,$00,$01,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$06,$05,$05,$00,$00,$00,$00
+  .BYTE $05,$03,$00,$03,$E4,$E5,$E5,$E4
+  .BYTE $E5,$E4,$E5,$E5,$E5,$E5,$E4,$E4
+  .BYTE $E5,$E5,$E5,$E2,$E3,$00,$E3,$E3
+  .BYTE $E3,$E3,$E3,$E3,$E3,$E3,$E3,$0A
+  .BYTE $0D,$0C,$0D,$0D,$0D,$07,$0C,$E3
+  .BYTE $E3,$E3,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$E1,$E3,$E3,$E3,$00,$E1,$10
+START_PF1:
+  .BYTE $20,$20,$01,$90,$01,$91,$82,$82
+  .BYTE $83,$83,$83,$83,$00,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$10
+  .BYTE $91,$11,$11,$29,$02,$01,$02,$11
+  .BYTE $01,$26,$28,$10,$01,$01,$01,$01
+  .BYTE $02,$25,$01,$01,$01,$02,$01,$E0
+  .BYTE $27,$10,$11,$11,$11,$10,$01,$01
+  .BYTE $10,$27,$01,$01,$01,$01,$01,$27
+  .BYTE $02,$02,$01,$01,$01,$01,$01,$01
+  .BYTE $11,$90,$90,$90,$90,$10,$00,$10
+  .BYTE $10,$10,$10,$00,$07,$07,$08,$07
+  .BYTE $00,$00,$08,$29,$10,$10,$10,$10
+  .BYTE $10,$10,$10,$00,$E6,$18,$04,$18
+  .BYTE $E8,$EA,$E9,$EC,$EC,$EC,$02,$01
+  .BYTE $02,$02,$E8,$03,$02,$03,$E8,$EC
+  .BYTE $02,$E5,$05,$06,$E0,$1A,$03,$02
+  .BYTE $00,$01,$02,$03,$01,$01,$00,$05
+  .BYTE $03,$03,$05,$03,$03,$04,$03,$02
+  .BYTE $05,$02,$04,$03,$03,$04,$02,$05
+  .BYTE $05,$01,$01,$03,$02,$03,$05,$05
+  .BYTE $03,$00,$20,$00,$04,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$00,$00
+  .BYTE $00,$00,$E3,$E3,$00,$10,$00,$00
+  .BYTE $00,$00,$00,$00,$00,$00,$E1,$E4
+  .BYTE $0A,$06,$04,$08,$06,$0D,$09,$0B
+  .BYTE $00,$00,$10,$10,$10,$10,$10,$10
+  .BYTE $10,$10,$10,$10,$10,$10,$10,$10
+  .BYTE $10,$00,$00,$E1,$01,$E1,$E0,$20
+START_PF2:
+  .BYTE $30,$30,$10,$92,$90,$00,$00,$00
+  .BYTE $00,$00,$00,$00,$10,$10,$10,$10
+  .BYTE $10,$10,$10,$10,$10,$10,$10,$20
+  .BYTE $84,$92,$90,$02,$27,$27,$28,$91
+  .BYTE $26,$01,$10,$27,$27,$27,$27,$27
+  .BYTE $27,$01,$27,$27,$27,$28,$27,$27
+  .BYTE $01,$91,$83,$82,$91,$26,$26,$26
+  .BYTE $27,$01,$26,$26,$25,$25,$25,$01
+  .BYTE $27,$26,$26,$26,$26,$25,$24,$91
+  .BYTE $91,$83,$84,$82,$84,$20,$10,$20
+  .BYTE $20,$20,$20,$10,$00,$00,$00,$00
+  .BYTE $10,$10,$00,$00,$20,$20,$20,$20
+  .BYTE $20,$20,$20,$10,$00,$00,$00,$30
+  .BYTE $00,$00,$30,$E5,$E6,$03,$E8,$00
+  .BYTE $00,$EA,$30,$EA,$EC,$EC,$30,$E8
+  .BYTE $00,$EA,$EC,$01,$1A,$15,$00,$20
+  .BYTE $E8,$E8,$00,$05,$05,$05,$05,$10
+  .BYTE $10,$10,$03,$05,$05,$05,$05,$05
+  .BYTE $04,$05,$03,$05,$10,$05,$05,$02
+  .BYTE $03,$04,$03,$00,$05,$05,$03,$02
+  .BYTE $00,$01,$30,$10,$03,$10,$10,$10
+  .BYTE $10,$10,$10,$10,$10,$10,$10,$10
+  .BYTE $10,$10,$00,$00,$10,$20,$10,$10
+  .BYTE $10,$10,$10,$10,$10,$10,$00,$06
+  .BYTE $05,$E3,$07,$E3,$00,$E1,$05,$06
+  .BYTE $10,$10,$20,$20,$20,$20,$20,$20
+  .BYTE $20,$20,$20,$20,$20,$20,$20,$20
+  .BYTE $20,$10,$10,$00,$E1,$E0,$01,$30
 
 .RUN START
