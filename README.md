@@ -10,7 +10,7 @@ This project is developed solely by utilizing the automation features of the `js
 
 - Run `npm install` once to install the Node tooling dependencies.
 - `node tools/assemble.js` assembles `src/a8tanks.asm` to `build/a8tanks.xex` and converts it to `build/a8tanks.atr`.
-- `node tools/run.js --os-rom /path/to/ATARIXL.ROM --basic-rom /path/to/ATARIBAS.ROM` serves `jsA8E`, assembles the source through the current grouped automation API, runs it to the assembled entry breakpoint, and writes build artifacts to `build/`.
+- `node tools/run.js --os-rom /path/to/ATARIXL.ROM --basic-rom /path/to/ATARIBAS.ROM` uses the headless `jsA8E` runtime by default (pass `--show` for Chromium UI mode), assembles the source through the current grouped automation API, runs it to the assembled entry breakpoint, and writes build artifacts to `build/`.
 
 ## Automation Usage Strategy
 

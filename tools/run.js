@@ -7,6 +7,9 @@ const path = require("path");
 const { createStaticServer } = require("./lib/static_server");
 const { repoRoot } = require("./lib/jsa8e_assembler");
 const { convertXexToAtr } = require("./lib/xex_to_atr");
+const {
+  createHeadlessAutomation,
+} = require(path.join(__dirname, "..", "automation", "A8E", "jsA8E", "headless"));
 
 function printHelp() {
   console.log(`Usage: node tools/run.js [options]
@@ -15,8 +18,8 @@ Options:
   --source <path>      Assembly source file to assemble and run
   --os-rom <path>      Path to ATARIXL.ROM
   --basic-rom <path>   Path to ATARIBAS.ROM
-  --port <number>      Static server port (default: random free port)
-  --show               Launch Chromium with a visible window
+  --port <number>      Static server port for browser mode (default: random free port)
+  --show               Use Chromium UI mode instead of the default headless runtime
   --timeout-ms <ms>    Breakpoint wait timeout / failure snapshot timeout (default: 5000)
   --xex-output <path>  Where to write the assembled XEX
   --atr-output <path>  Where to write the converted ATR
@@ -29,6 +32,7 @@ Options:
 function parseArgs(argv) {
   const options = {
     headless: true,
+    show: false,
     timeoutMs: 5000,
   };
 
@@ -40,6 +44,7 @@ function parseArgs(argv) {
     }
     if (arg === "--show") {
       options.headless = false;
+      options.show = true;
       continue;
     }
     if (arg === "--source") {
@@ -261,8 +266,7 @@ function formatFailureMessage(result) {
   return `jsA8E automation failed during ${result && result.stage ? result.stage : "run"}.`;
 }
 
-async function runInBrowser(options) {
-  const { chromium } = requirePlaywright();
+function resolveRunPaths(options) {
   const sourcePath = resolveRepoPath(options.source || "src/a8tanks.asm");
   const sourceName = path.relative(repoRoot, sourcePath).replace(/\\/g, "/");
   const sourceText = fs.readFileSync(sourcePath, "utf8");
@@ -281,6 +285,71 @@ async function runInBrowser(options) {
     "ATARIBAS.ROM",
     "automation/A8E/ATARIBAS.ROM",
   ]);
+
+  return {
+    artifactsPath: artifactsPath,
+    atrOutput: atrOutput,
+    basicRomPath: basicRomPath,
+    osRomPath: osRomPath,
+    screenshotPath: screenshotPath,
+    sourceName: sourceName,
+    sourcePath: sourcePath,
+    sourceText: sourceText,
+    xexOutput: xexOutput,
+  };
+}
+
+async function finalizeRunResult(result, paths, timeoutMs) {
+  const xexBytes = toBuffer(result && result.build ? result.build.bytes : null);
+  if (xexBytes) {
+    ensureParentDir(paths.xexOutput);
+    fs.writeFileSync(paths.xexOutput, xexBytes);
+  }
+
+  const artifactRecord = buildArtifactRecord(result || {}, {
+    artifactsPath: paths.artifactsPath,
+    atrOutput: paths.atrOutput,
+    basicRomPath: paths.basicRomPath,
+    osRomPath: paths.osRomPath,
+    screenshotPath: paths.screenshotPath,
+    sourcePath: paths.sourcePath,
+    timeoutMs: timeoutMs,
+    xexOutput: paths.xexOutput,
+  });
+  writeJson(paths.artifactsPath, artifactRecord);
+
+  const screenshotBase64 = getArtifactScreenshotBase64(result && result.artifacts);
+  if (screenshotBase64) {
+    ensureParentDir(paths.screenshotPath);
+    fs.writeFileSync(paths.screenshotPath, Buffer.from(screenshotBase64, "base64"));
+  }
+
+  if (xexBytes) {
+    const atrBytes = convertXexToAtr(xexBytes);
+    if (!atrBytes) {
+      throw new Error("Unable to convert assembled XEX into a bootable ATR.");
+    }
+    ensureParentDir(paths.atrOutput);
+    fs.writeFileSync(paths.atrOutput, atrBytes);
+  }
+
+  if (!result || !result.ok) {
+    throw new Error(formatFailureMessage(result));
+  }
+
+  return {
+    artifactsPath: paths.artifactsPath,
+    atrOutput: paths.atrOutput,
+    runAddr: result.build.runAddr,
+    screenshotPath: screenshotBase64 ? paths.screenshotPath : null,
+    sourcePath: paths.sourcePath,
+    xexOutput: paths.xexOutput,
+  };
+}
+
+async function runInBrowser(options) {
+  const { chromium } = requirePlaywright();
+  const paths = resolveRunPaths(options);
 
   const server = await createStaticServer({
     rootDir: repoRoot,
@@ -309,8 +378,8 @@ async function runInBrowser(options) {
       { timeout: Math.max(options.timeoutMs, 5000) },
     );
 
-    const osBase64 = fs.readFileSync(osRomPath).toString("base64");
-    const basicBase64 = fs.readFileSync(basicRomPath).toString("base64");
+    const osBase64 = fs.readFileSync(paths.osRomPath).toString("base64");
+    const basicBase64 = fs.readFileSync(paths.basicRomPath).toString("base64");
 
     const result = await page.evaluate(
       async ({ osBase64, basicBase64, sourceName, sourceText, timeoutMs }) => {
@@ -448,60 +517,167 @@ async function runInBrowser(options) {
       {
         basicBase64: basicBase64,
         osBase64: osBase64,
-        sourceName: sourceName,
-        sourceText: sourceText,
+        sourceName: paths.sourceName,
+        sourceText: paths.sourceText,
         timeoutMs: options.timeoutMs,
       },
     );
-
-    const xexBytes = toBuffer(result && result.build ? result.build.bytes : null);
-    if (xexBytes) {
-      ensureParentDir(xexOutput);
-      fs.writeFileSync(xexOutput, xexBytes);
-    }
-
-    const artifactRecord = buildArtifactRecord(result || {}, {
-      artifactsPath: artifactsPath,
-      atrOutput: atrOutput,
-      basicRomPath: basicRomPath,
-      osRomPath: osRomPath,
-      screenshotPath: screenshotPath,
-      sourcePath: sourcePath,
-      timeoutMs: options.timeoutMs,
-      xexOutput: xexOutput,
-    });
-    writeJson(artifactsPath, artifactRecord);
-
-    const screenshotBase64 = getArtifactScreenshotBase64(result && result.artifacts);
-    if (screenshotBase64) {
-      ensureParentDir(screenshotPath);
-      fs.writeFileSync(screenshotPath, Buffer.from(screenshotBase64, "base64"));
-    }
-
-    if (xexBytes) {
-      const atrBytes = convertXexToAtr(xexBytes);
-      if (!atrBytes) {
-        throw new Error("Unable to convert assembled XEX into a bootable ATR.");
-      }
-      ensureParentDir(atrOutput);
-      fs.writeFileSync(atrOutput, atrBytes);
-    }
-
-    if (!result || !result.ok) {
-      throw new Error(formatFailureMessage(result));
-    }
-
-    return {
-      artifactsPath: artifactsPath,
-      atrOutput: atrOutput,
-      runAddr: result.build.runAddr,
-      screenshotPath: screenshotBase64 ? screenshotPath : null,
-      sourcePath: sourcePath,
-      xexOutput: xexOutput,
-    };
+    return finalizeRunResult(result, paths, options.timeoutMs);
   } finally {
     if (browser) await browser.close();
     await server.close();
+  }
+}
+
+async function runInHeadless(options) {
+  const paths = resolveRunPaths(options);
+  const osRomBytes = fs.readFileSync(paths.osRomPath);
+  const basicRomBytes = fs.readFileSync(paths.basicRomPath);
+  const runtime = await createHeadlessAutomation({
+    frameDelayMs: 0,
+    skipRendering: true,
+    turbo: true,
+  });
+
+  let progressToken = 0;
+  const progressEvents = [];
+  try {
+    const api = await runtime.api.whenReady();
+    if (api.events && typeof api.events.subscribe === "function") {
+      progressToken = api.events.subscribe("progress", (event) => {
+        progressEvents.push(Object.assign({}, event));
+      });
+    }
+
+    const capabilities = await api.getCapabilities();
+    const artifactOptions = {
+      screenshot: true,
+      traceTailLimit: 64,
+      runConfiguration: {
+        sourceName: paths.sourceName,
+        timeoutMs: options.timeoutMs,
+      },
+      scenarioMarkers: {
+        sourceName: paths.sourceName,
+      },
+    };
+
+    await api.media.loadRom("os", osRomBytes);
+    await api.media.loadRom("basic", basicRomBytes);
+
+    const build = await api.dev.assembleSource({
+      name: paths.sourceName,
+      text: paths.sourceText,
+    });
+
+    if (!build || !build.ok) {
+      return finalizeRunResult(
+        {
+          ok: false,
+          stage: "assemble",
+          artifacts:
+            capabilities && capabilities.failureSnapshots
+              ? await api.artifacts.captureFailureState(
+                  Object.assign({}, artifactOptions, {
+                    operation: "assembleSource",
+                    failure: {
+                      message: build && build.error ? String(build.error) : "Assembly failed",
+                      reason: "assemble_failed",
+                    },
+                  }),
+                )
+              : null,
+          build: build,
+          capabilities: capabilities,
+          progressEvents: progressEvents,
+          systemState: await api.getSystemState(),
+        },
+        paths,
+        options.timeoutMs,
+      );
+    }
+
+    const entryPoint = typeof build.runAddr === "number" ? build.runAddr : 0x2000;
+    artifactOptions.runConfiguration.entryPoint = entryPoint;
+    artifactOptions.scenarioMarkers.entryPoint = entryPoint;
+    await api.debug.setBreakpoints([entryPoint]);
+
+    const run = await api.dev.runXex({
+      build: build,
+      saveHostFile: true,
+    });
+
+    const stop = await api.debug.waitForBreakpoint(
+      Object.assign({}, artifactOptions, {
+        operation: "waitForBreakpoint",
+        targetPc: entryPoint,
+        timeoutMs: options.timeoutMs,
+      }),
+    );
+
+    if (!stop || stop.ok === false) {
+      return finalizeRunResult(
+        {
+          ok: false,
+          stage: "waitForBreakpoint",
+          artifacts:
+            stop && stop.artifactSchemaVersion
+              ? stop
+              : await api.artifacts.captureFailureState(
+                  Object.assign({}, artifactOptions, {
+                    operation: "waitForBreakpoint",
+                    targetPc: entryPoint,
+                    timeoutMs: options.timeoutMs,
+                    failure: {
+                      message: "Breakpoint wait failed",
+                      reason: "breakpoint_wait_failed",
+                      targetPc: entryPoint,
+                      timeoutMs: options.timeoutMs,
+                    },
+                  }),
+                ),
+          build: build,
+          capabilities: capabilities,
+          progressEvents: progressEvents,
+          run: run,
+          stop: stop,
+          systemState: await api.getSystemState(),
+        },
+        paths,
+        options.timeoutMs,
+      );
+    }
+
+    const artifacts = await api.artifacts.collectArtifacts(
+      Object.assign({}, artifactOptions, {
+        operation: "tools.run",
+      }),
+    );
+
+    return finalizeRunResult(
+      {
+        ok: true,
+        artifacts: artifacts,
+        build: build,
+        capabilities: capabilities,
+        progressEvents: progressEvents,
+        run: run,
+        stop: stop,
+        systemState: await api.getSystemState(),
+      },
+      paths,
+      options.timeoutMs,
+    );
+  } finally {
+    if (
+      progressToken &&
+      runtime.api &&
+      runtime.api.events &&
+      typeof runtime.api.events.unsubscribe === "function"
+    ) {
+      runtime.api.events.unsubscribe(progressToken);
+    }
+    await runtime.dispose();
   }
 }
 
@@ -512,7 +688,7 @@ async function main() {
     return;
   }
 
-  const summary = await runInBrowser(options);
+  const summary = options.show ? await runInBrowser(options) : await runInHeadless(options);
   const runAddr =
     typeof summary.runAddr === "number"
       ? `$${summary.runAddr.toString(16).toUpperCase().padStart(4, "0")}`
