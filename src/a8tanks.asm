@@ -1920,9 +1920,10 @@ SS_NOWIND:
   CMP #160
   BCS SS_OUT
   LDA SYH
-  BMI SS_FLY               ; above the top of the field
+  CMP #$E0
+  BCS SS_FLY               ; -32..-1: above the top of the field
   CMP #PLAY_ROWS
-  BCS SS_OUT
+  BCS SS_OUT               ; below the bottom
   LDX SXH
   CMP HEIGHT,X
   BCS SS_HIT
@@ -1996,8 +1997,7 @@ DRAW_SHELL:
   STA PM_P2+1,Y
 DS1:
   LDA SYH
-  BMI DS_HIDE
-  CMP #PLAY_ROWS-2
+  CMP #PLAY_ROWS-2         ; also hides a shell above the field (wrapped y)
   BCS DS_HIDE
   CLC
   ADC #PM_Y0
