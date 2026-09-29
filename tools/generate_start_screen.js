@@ -9,13 +9,17 @@ const repoRoot = path.resolve(__dirname, "..");
 const sourceImage = path.resolve(repoRoot, process.argv[2] || "build/a8tanks-ref.png");
 const outputPath = path.resolve(repoRoot, process.argv[3] || "src/a8tanks.asm");
 
+const { replaceBlock } = require("./lib/asm_blocks");
+
 const WIDTH = 160;
-const HEIGHT = 224;
+const SOURCE_HEIGHT = 224;
+// The bottom of the reference image only holds border artifacts; the game
+// replaces it with a one-line text row (mode select / prompt).
+const HEIGHT = 208;
 const BYTES_PER_ROW = WIDTH / 4;
-const CODE_ORG = 0x2000;
-const DISPLAY_LIST_ORG = 0x2c00;
-const BITMAP_ORG = 0x3000;
-const TABLE_ORG = 0x5400;
+const DISPLAY_LIST_ORG = 0x8000;
+const BITMAP_ORG = 0x8400;
+const TABLE_ORG = 0xa800;
 
 function hex(value, width = 2) {
   return `$${(value >>> 0).toString(16).toUpperCase().padStart(width, "0")}`;
@@ -25,7 +29,7 @@ function runMagickPpm(inputPath) {
   const magick = process.env.MAGICK || "magick";
   const result = spawnSync(
     magick,
-    [inputPath, "-resize", `${WIDTH}x${HEIGHT}!`, "ppm:-"],
+    [inputPath, "-resize", `${WIDTH}x${SOURCE_HEIGHT}!`, "ppm:-"],
     { encoding: null, maxBuffer: 32 * 1024 * 1024 },
   );
   if (result.status !== 0) {
@@ -66,13 +70,13 @@ function parsePpm(buffer) {
   const width = Number(readToken());
   const height = Number(readToken());
   const max = Number(readToken());
-  if (magic !== "P6" || width !== WIDTH || height !== HEIGHT || max !== 255) {
+  if (magic !== "P6" || width !== WIDTH || height !== SOURCE_HEIGHT || max !== 255) {
     throw new Error(`Unexpected PPM header: ${magic} ${width}x${height} max ${max}`);
   }
   if (buffer[index] === 9 || buffer[index] === 10 || buffer[index] === 13 || buffer[index] === 32) {
     index += 1;
   }
-  const expectedLength = WIDTH * HEIGHT * 3;
+  const expectedLength = WIDTH * SOURCE_HEIGHT * 3;
   const data = buffer.subarray(index, index + expectedLength);
   if (data.length !== expectedLength) {
     throw new Error(`Unexpected PPM payload length: ${data.length}`);
@@ -306,172 +310,61 @@ function byteLine(bytes) {
   return `  .BYTE ${bytes.map((value) => hex(value)).join(",")}`;
 }
 
-function generateSource(encoded) {
+// The title screen is a mode E bitmap whose per-scanline palette is applied by
+// the title DLI in src/a8tanks.asm.  Everything data-like is emitted here:
+// display list, bitmap and the four per-scanline colour tables.
+function generateTitleBlock(encoded) {
   const lines = [];
-  lines.push("; =============================================================================");
-  lines.push("; A8Tanks - Atari 800 XL tank game");
-  lines.push("; Generated bitmap start screen. Regenerate with:");
-  lines.push(";   node tools/generate_start_screen.js");
-  lines.push("; =============================================================================");
-  lines.push("");
-  lines.push(`.ORG ${hex(CODE_ORG, 4)}`);
-  lines.push("");
-  lines.push("CONSOL = $D01F");
-  lines.push("PORTB  = $D301");
-  lines.push("SDMCTL = $022F");
-  lines.push("SDLSTL = $0230");
-  lines.push("");
-  lines.push("COLOR0 = $02C4");
-  lines.push("COLOR1 = $02C5");
-  lines.push("COLOR2 = $02C6");
-  lines.push("COLOR4 = $02C8");
-  lines.push("");
-  lines.push("COLPF0 = $D016");
-  lines.push("COLPF1 = $D017");
-  lines.push("COLPF2 = $D018");
-  lines.push("COLBK  = $D01A");
-  lines.push("");
-  lines.push("NMIEN  = $D40E");
-  lines.push("VDSLST = $0200");
-  lines.push("RTCLOK = $0014");
-  lines.push("WSYNC  = $D40A");
-  lines.push("");
-  lines.push(`START_SCREEN_ROWS = ${hex(HEIGHT)}`);
-  lines.push("");
-  lines.push("START:");
-  lines.push("  JSR INIT");
-  lines.push("  JSR SHOW_TITLE_SCREEN");
-  lines.push("");
-  lines.push("GAME_LOOP:");
-  lines.push("  JMP GAME_LOOP");
-  lines.push("");
-  lines.push("INIT:");
-  lines.push("  LDA #$00");
-  lines.push("  STA FRAME_COUNTER");
-  lines.push("  LDA #$FF              ; keep OS ROM, disable BASIC, disable self-test");
-  lines.push("  STA PORTB");
-  lines.push("  LDA #$22              ; display list DMA + normal playfield width");
-  lines.push("  STA SDMCTL");
-  lines.push("  JSR INIT_COLORS");
-  lines.push("");
-  lines.push("  LDA #<MY_DISPLAY_LIST");
-  lines.push("  STA SDLSTL");
-  lines.push("  LDA #>MY_DISPLAY_LIST");
-  lines.push("  STA SDLSTL+1");
-  lines.push("");
-  lines.push("  LDA #<DLI_HANDLER");
-  lines.push("  STA VDSLST");
-  lines.push("  LDA #>DLI_HANDLER");
-  lines.push("  STA VDSLST+1");
-  lines.push("  LDA #$C0              ; enable DLI and OS VBLANK");
-  lines.push("  STA NMIEN");
-  lines.push("  RTS");
-  lines.push("");
-  lines.push("INIT_COLORS:");
-  lines.push(`  LDA #${hex(encoded.colbk[0])}`);
-  lines.push("  STA COLOR4");
-  lines.push("  STA COLBK");
-  lines.push(`  LDA #${hex(encoded.pf0[0])}`);
-  lines.push("  STA COLOR0");
-  lines.push("  STA COLPF0");
-  lines.push(`  LDA #${hex(encoded.pf1[0])}`);
-  lines.push("  STA COLOR1");
-  lines.push("  STA COLPF1");
-  lines.push(`  LDA #${hex(encoded.pf2[0])}`);
-  lines.push("  STA COLOR2");
-  lines.push("  STA COLPF2");
-  lines.push("  RTS");
-  lines.push("");
-  lines.push("DLI_HANDLER:");
-  lines.push("  PHA");
-  lines.push("  TXA");
-  lines.push("  PHA");
-  lines.push("");
-  lines.push("  LDX #$00");
-  lines.push("DLI_LOOP:");
-  lines.push("  STA WSYNC");
-  lines.push("  LDA START_COLBK,X");
-  lines.push("  STA COLBK");
-  lines.push("  LDA START_PF0,X");
-  lines.push("  STA COLPF0");
-  lines.push("  LDA START_PF1,X");
-  lines.push("  STA COLPF1");
-  lines.push("  LDA START_PF2,X");
-  lines.push("  STA COLPF2");
-  lines.push("  INX");
-  lines.push("  CPX #START_SCREEN_ROWS");
-  lines.push("  BNE DLI_LOOP");
-  lines.push("");
-  lines.push("  STA WSYNC");
-  lines.push(`  LDA #${hex(encoded.colbk[HEIGHT - 1])}`);
-  lines.push("  STA COLBK");
-  lines.push("  STA COLOR4");
-  lines.push("");
-  lines.push("  PLA");
-  lines.push("  TAX");
-  lines.push("  PLA");
-  lines.push("  RTI");
-  lines.push("");
-  lines.push("SHOW_TITLE_SCREEN:");
-  lines.push("WAIT_FOR_START_RELEASE:");
-  lines.push("  JSR READ_START_KEY");
-  lines.push("  BEQ WAIT_FOR_START_RELEASE");
-  lines.push("");
-  lines.push("WAIT_FOR_START_PRESS:");
-  lines.push("  LDA RTCLOK");
-  lines.push("WAIT_FRAME:");
-  lines.push("  CMP RTCLOK");
-  lines.push("  BEQ WAIT_FRAME");
-  lines.push("  INC FRAME_COUNTER");
-  lines.push("  JSR READ_START_KEY");
-  lines.push("  BNE WAIT_FOR_START_PRESS");
-  lines.push("  RTS");
-  lines.push("");
-  lines.push("READ_START_KEY:");
-  lines.push("  LDA CONSOL");
-  lines.push("  AND #$01");
-  lines.push("  RTS");
-  lines.push("");
-  lines.push("FRAME_COUNTER:");
-  lines.push("  .BYTE $00");
+  lines.push(`TITLE_ROWS = ${hex(HEIGHT)}`);
+  lines.push(`TITLE_COLBK0 = ${hex(encoded.colbk[0])}`);
+  lines.push(`TITLE_PF0_0 = ${hex(encoded.pf0[0])}`);
+  lines.push(`TITLE_PF1_0 = ${hex(encoded.pf1[0])}`);
+  lines.push(`TITLE_PF2_0 = ${hex(encoded.pf2[0])}`);
   lines.push("");
   lines.push(`.ORG ${hex(DISPLAY_LIST_ORG, 4)}`);
   lines.push("");
-  lines.push("MY_DISPLAY_LIST:");
+  lines.push("TITLE_DISPLAY_LIST:");
   lines.push("  .BYTE $F0              ; 8 blank scanlines, DLI sets bitmap palettes");
   for (let y = 0; y < HEIGHT; y += 1) {
     lines.push("  .BYTE $4E");
-    lines.push(`  .WORD BITMAP_DATA+${hex(y * BYTES_PER_ROW, 4)}`);
+    lines.push(`  .WORD TITLE_BITMAP+${hex(y * BYTES_PER_ROW, 4)}`);
   }
+  lines.push("  .BYTE $42              ; mode 2 text row for the mode select prompt");
+  lines.push("  .WORD TITLE_TEXT");
   lines.push("  .BYTE $41");
-  lines.push("  .WORD MY_DISPLAY_LIST");
+  lines.push("  .WORD TITLE_DISPLAY_LIST");
   lines.push("");
   lines.push(`.ORG ${hex(BITMAP_ORG, 4)}`);
   lines.push("");
-  lines.push("BITMAP_DATA:");
+  lines.push("TITLE_BITMAP:");
   for (const row of encoded.bitmapRows) lines.push(byteLine(row));
   lines.push("");
   lines.push(`.ORG ${hex(TABLE_ORG, 4)}`);
   lines.push("");
-  lines.push("START_COLBK:");
+  lines.push("TITLE_COLBK:");
   for (let y = 0; y < HEIGHT; y += 8) lines.push(byteLine(encoded.colbk.slice(y, y + 8)));
-  lines.push("START_PF0:");
+  lines.push("TITLE_PF0:");
   for (let y = 0; y < HEIGHT; y += 8) lines.push(byteLine(encoded.pf0.slice(y, y + 8)));
-  lines.push("START_PF1:");
+  lines.push("TITLE_PF1:");
   for (let y = 0; y < HEIGHT; y += 8) lines.push(byteLine(encoded.pf1.slice(y, y + 8)));
-  lines.push("START_PF2:");
+  lines.push("TITLE_PF2:");
   for (let y = 0; y < HEIGHT; y += 8) lines.push(byteLine(encoded.pf2.slice(y, y + 8)));
-  lines.push("");
-  lines.push(".RUN START");
-  lines.push("");
-  return lines.join("\n");
+  return lines;
 }
 
-if (!fs.existsSync(sourceImage)) {
-  throw new Error(`Source image not found: ${sourceImage}`);
+function writeTitleBlock(encoded, targetPath) {
+  replaceBlock(targetPath, "TITLE SCREEN", "node tools/generate_start_screen.js", generateTitleBlock(encoded));
 }
 
-const ppm = parsePpm(runMagickPpm(sourceImage));
-const encoded = encodeImage(ppm);
-fs.writeFileSync(outputPath, generateSource(encoded));
-console.log(`Generated ${path.relative(repoRoot, outputPath)} from ${path.relative(repoRoot, sourceImage)}`);
+module.exports = { generateTitleBlock, writeTitleBlock, HEIGHT };
+
+if (require.main === module) {
+  if (!fs.existsSync(sourceImage)) {
+    throw new Error(`Source image not found: ${sourceImage}`);
+  }
+
+  const ppm = parsePpm(runMagickPpm(sourceImage));
+  const encoded = encodeImage(ppm);
+  writeTitleBlock(encoded, outputPath);
+  console.log(`Updated ${path.relative(repoRoot, outputPath)} from ${path.relative(repoRoot, sourceImage)}`);
+}
